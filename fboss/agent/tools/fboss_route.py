@@ -15,9 +15,9 @@ from argparse import ArgumentParser, ArgumentError
 from contextlib import contextmanager
 from thrift.transport import TSocket
 from thrift.protocol import TBinaryProtocol
-from fboss.agent import FbossCtrl
-from fboss.agent.ttypes import IpPrefix
-from fboss.agent.ttypes import UnicastRoute
+from fboss.ctrl import FbossCtrl
+from fboss.ctrl.ttypes import IpPrefix
+from fboss.ctrl.ttypes import UnicastRoute
 from facebook.network.Address.ttypes import BinaryAddress
 
 DEFAULT_CLIENTID = 1
