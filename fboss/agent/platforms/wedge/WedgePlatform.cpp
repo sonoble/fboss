@@ -127,10 +127,10 @@ void WedgePlatform::initLocalMac() {
 
   // TODO(t4543375): Get the base MAC address from the BMC.
   //
-  // For now, we take the MAC address from eth0, and enable the
+  // For now, we take the MAC address from ma1, and enable the
   // "locally administered" bit.  This MAC should be unique, and it's fine for
   // us to use a locally administered address for now.
-  std::vector<std::string> cmd{"/sbin/ip", "address", "ls", "eth0"};
+  std::vector<std::string> cmd{"/sbin/ip", "address", "ls", "ma1"};
   Subprocess p(cmd, Subprocess::pipeStdout());
   auto out = p.communicate();
   p.waitChecked();
@@ -138,8 +138,8 @@ void WedgePlatform::initLocalMac() {
   if (idx == std::string::npos) {
     throw std::runtime_error("unable to determine local mac address");
   }
-  MacAddress eth0Mac(out.first.substr(idx + 11, 17));
-  localMac_ = MacAddress::fromHBO(eth0Mac.u64HBO() | 0x0000020000000000);
+  MacAddress ma1Mac(out.first.substr(idx + 11, 17));
+  localMac_ = MacAddress::fromHBO(ma1Mac.u64HBO() | 0x0000020000000000);
 }
 
 }} // facebook::fboss
