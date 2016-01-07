@@ -20,12 +20,15 @@ class WedgeProductInfo {
 
   void getInfo(ProductInfo& info);
   void initialize();
+  std::string getFabricLocation();
+  std::string getProductName();
 
  private:
   // Forbidden copy constructor and assignment operator
   WedgeProductInfo(WedgeProductInfo const &) = delete;
   WedgeProductInfo& operator=(WedgeProductInfo const &) = delete;
 
+  void initFromHostname();
   void parse(std::string data);
   ProductInfo productInfo_;
   folly::StringPiece path_;

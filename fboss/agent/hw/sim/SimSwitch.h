@@ -32,6 +32,12 @@ class SimSwitch : public HwSwitch {
   void clearWarmBootCache() override {}
   void injectPacket(std::unique_ptr<RxPacket> pkt);
   void initialConfigApplied() override {}
+  cfg::PortSpeed getPortSpeed(PortID port) const override {
+    return cfg::PortSpeed::GIGE;
+  }
+  cfg::PortSpeed getMaxPortSpeed(PortID port) const override {
+    return cfg::PortSpeed::GIGE;
+  }
 
   // TODO
   void updateStats(SwitchStats *switchStats) override {}
@@ -41,6 +47,10 @@ class SimSwitch : public HwSwitch {
       const folly::StringPiece namespaceString,
       const std::set<folly::StringPiece>& counterSet) override {
     return 0;
+  }
+
+  void fetchL2Table(std::vector<L2EntryThrift> *l2Table) override {
+    return;
   }
 
   void resetTxCount() { txCount_ = 0; }

@@ -44,6 +44,7 @@ TEST(Port, applyConfig) {
   cfg::SwitchConfig config;
   config.ports.resize(1);
   config.ports[0].logicalID = 1;
+  config.ports[0].name = "port1";
   config.ports[0].state = cfg::PortState::UP;
   config.vlans.resize(2);
   config.vlans[0].id = 2;
@@ -55,6 +56,15 @@ TEST(Port, applyConfig) {
   config.vlanPorts[1].logicalPort = 1;
   config.vlanPorts[1].vlanID = 5;
   config.vlanPorts[1].emitTags = true;
+  config.interfaces.resize(2);
+  config.interfaces[0].intfID = 2;
+  config.interfaces[0].vlanID = 2;
+  config.interfaces[0].__isset.mac = true;
+  config.interfaces[0].mac = "00:00:00:00:00:22";
+  config.interfaces[1].intfID = 5;
+  config.interfaces[1].vlanID = 5;
+  config.interfaces[1].__isset.mac = true;
+  config.interfaces[1].mac = "00:00:00:00:00:55";
 
   auto stateV1 = publishAndApplyConfig(stateV0, &config, &platform);
   auto portV1 = stateV1->getPort(PortID(1));
@@ -116,6 +126,9 @@ TEST(Port, initDefaultConfig) {
 
   // Applying an empty config should result in no changes.
   cfg::SwitchConfig config;
+  config.ports.resize(1);
+  config.ports[0].logicalID = 1;
+  config.ports[0].name = "port1";
   EXPECT_EQ(nullptr, publishAndApplyConfig(state, &config, &platform));
 
   // Adding a port entry in the config and initializing it with
@@ -221,12 +234,19 @@ TEST(PortMap, applyConfig) {
 
   // Applying an empty config shouldn't change a newly-constructed PortMap
   cfg::SwitchConfig config;
+  config.ports.resize(4);
+  config.ports[0].logicalID = 1;
+  config.ports[0].name = "port1";
+  config.ports[1].logicalID = 2;
+  config.ports[1].name = "port2";
+  config.ports[2].logicalID = 3;
+  config.ports[2].name = "port3";
+  config.ports[3].logicalID = 4;
+  config.ports[3].name = "port4";
   EXPECT_EQ(nullptr, publishAndApplyConfig(stateV0, &config, &platform));
 
   // Enable port 2
-  config.ports.resize(1);
-  config.ports[0].logicalID = 2;
-  config.ports[0].state = cfg::PortState::UP;
+  config.ports[1].state = cfg::PortState::UP;
   auto stateV1 = publishAndApplyConfig(stateV0, &config, &platform);
   auto portsV1 = stateV1->getPorts();
   ASSERT_NE(nullptr, portsV1);
@@ -261,14 +281,9 @@ TEST(PortMap, applyConfig) {
   EXPECT_EQ(nullptr, publishAndApplyConfig(stateV1, &config, &platform));
 
   // Now mark all ports up
-  config.ports.resize(4);
-  config.ports[0].logicalID = 1;
   config.ports[0].state = cfg::PortState::UP;
-  config.ports[1].logicalID = 2;
   config.ports[1].state = cfg::PortState::UP;
-  config.ports[2].logicalID = 3;
   config.ports[2].state = cfg::PortState::UP;
-  config.ports[3].logicalID = 4;
   config.ports[3].state = cfg::PortState::UP;
 
   auto stateV2 = publishAndApplyConfig(stateV1, &config, &platform);
@@ -305,7 +320,14 @@ TEST(PortMap, applyConfig) {
   // If we remove port3 from the config, it should be marked down
   config.ports.resize(3);
   config.ports[0].logicalID = 1;
+  config.ports[0].name = "port1";
+  config.ports[0].state = cfg::PortState::UP;
+  config.ports[1].logicalID = 2;
+  config.ports[1].name = "port2";
+  config.ports[1].state = cfg::PortState::UP;
   config.ports[2].logicalID = 4;
+  config.ports[2].name = "port4";
+  config.ports[2].state = cfg::PortState::UP;
   auto stateV3 = publishAndApplyConfig(stateV2, &config, &platform);
   auto portsV3 = stateV3->getPorts();
   ASSERT_NE(nullptr, portsV3);

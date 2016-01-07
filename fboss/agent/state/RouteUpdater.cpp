@@ -20,6 +20,11 @@
 #include "fboss/agent/state/RouteTableRib.h"
 #include "fboss/agent/FbossError.h"
 
+using folly::IPAddress;
+using boost::container::flat_map;
+using boost::container::flat_set;
+using folly::CIDRNetwork;
+
 namespace facebook { namespace fboss {
 
 using std::make_shared;
@@ -228,6 +233,38 @@ void RouteUpdater::delRoute(RouterID id, const folly::IPAddress& network,
   }
 }
 
+template<typename RtRibT, typename AddrT>
+void RouteUpdater::getFwdInfoFromNhop(RtRibT* nRib,
+    ClonedRib* ribCloned, const AddrT& nh, bool* hasToCpuNhops,
+    bool* hasDropNhops, RouteForwardNexthops* fwd) {
+  auto rt = nRib->longestMatch(nh);
+  if (rt == nullptr) {
+    VLOG (3) <<" Could not find route for nhop :  "<< nh;
+    // Un resolvable next hop
+    return;
+  }
+  if (rt->needResolve()) {
+    resolve(rt.get(), nRib, ribCloned);
+  }
+  if (rt->isResolved()) {
+    const auto& fwdInfo = rt->getForwardInfo();
+    if (fwdInfo.isToCPU()) {
+      *hasToCpuNhops = true;
+    } else if (fwdInfo.isDrop()) {
+      *hasDropNhops = true;
+    } else {
+      const auto& nhops = fwdInfo.getNexthops();
+      // if the route used to resolve the nexthop is directly connected
+      if (rt->isConnected()) {
+        const auto& rtNh = *nhops.begin();
+        fwd->emplace(rtNh.intf, nh);
+      } else {
+        fwd->insert(nhops.begin(), nhops.end());
+      }
+    }
+  }
+}
+
 template<typename RouteT, typename RtRibT>
 void RouteUpdater::resolve(RouteT* route, RtRibT* rib, ClonedRib* ribCloned) {
   CHECK(!route->isConnected());
@@ -257,65 +294,43 @@ void RouteUpdater::resolve(RouteT* route, RtRibT* rib, ClonedRib* ribCloned) {
   // mark this route is in processing. This processing bit shall be cleared
   // in setUnresolvable() or setResolved()
   route->setFlagsProcessing();
+  bool hasToCpuNhops{false};
+  bool hasDropNhops{false};
   // loop through all nexthops to find out the forward info
   for (const auto& nh : route->nexthops()) {
     if (nh.isV4()) {
       auto nRib = ribCloned->v4.rib.get();
-      auto rt = nRib->longestMatch(nh.asV4());
-      if (rt == nullptr) {
-        VLOG (3) <<" Could not find route for nhop :  "<< nh.asV4();
-        // try next nexthop
-        continue;
-      }
-      if (rt->needResolve()) {
-        resolve(rt.get(), nRib, ribCloned);
-      }
-      if (rt->isResolved()) {
-        // if the route used to resolve the nexthop is directly connected
-        const auto nhops = rt->getForwardInfo().getNexthops();
-        if (rt->isConnected()) {
-          const auto& rtNh = *nhops.begin();
-          fwd.emplace(rtNh.intf, nh);
-        } else {
-          fwd.insert(nhops.begin(), nhops.end());
-        }
-      }
+      getFwdInfoFromNhop(nRib, ribCloned, nh.asV4(), &hasToCpuNhops,
+          &hasDropNhops, &fwd);
     } else {
       auto nRib = ribCloned->v6.rib.get();
-      auto rt = nRib->longestMatch(nh.asV6());
-      if (rt == nullptr) {
-        // try next nexthop
-        continue;
-      }
-      if (rt->needResolve()) {
-        resolve(rt.get(), nRib, ribCloned);
-      }
-      if (rt->isResolved()) {
-        // if the route used to resolve the nexthop is directly connected
-        const auto nhops = rt->getForwardInfo().getNexthops();
-        if (rt->isConnected()) {
-          const auto& rtNh = *nhops.begin();
-          fwd.emplace(rtNh.intf, nh);
-        } else {
-          fwd.insert(nhops.begin(), nhops.end());
-        }
-      }
+      getFwdInfoFromNhop(nRib, ribCloned, nh.asV6(), &hasToCpuNhops,
+          &hasDropNhops, &fwd);
     }
   }
-  if (fwd.empty()) {
-    route->setUnresolvable();
+  if (hasToCpuNhops || hasDropNhops || fwd.size()) {
+    VLOG(3) << "Resolved route " << route->str();
+  } else {
     VLOG(3) << "Cannot resolve route " << route->str();
+  }
+  if (fwd.empty()) {
+    if (hasToCpuNhops) {
+      route->setResolved(RouteForwardAction::TO_CPU);
+    } else if (hasDropNhops) {
+      route->setResolved(RouteForwardAction::DROP);
+    } else {
+      route->setUnresolvable();
+    }
   } else {
     route->setResolved(std::move(fwd));
-    VLOG(3) << "Resolved route " << route->str();
   }
 }
 
 
 template<typename RibT>
 void RouteUpdater::setRoutesWithNhopsForResolution(RibT* rib) {
-  for (auto& rt : rib->getAllNodes()) {
-    auto route = rt.second.get();
+  for (auto& rt : rib->routes()) {
+    auto route = rt.value().get();
     if (route->isWithNexthops()) {
       if (route->isPublished()) {
         auto newRoute = route->clone(RibT::RouteType::Fields::COPY_ONLY_PREFIX);
@@ -331,8 +346,8 @@ void RouteUpdater::setRoutesWithNhopsForResolution(RibT* rib) {
 namespace {
 template<typename RibT>
 bool allRouteFlagsCleared(const RibT* rib) {
-  for (const auto& rt : rib->getAllNodes()) {
-    const auto route = rt.second.get();
+  for (const auto& rt : rib->routes()) {
+    const auto& route = rt.value();
     if (route->isWithNexthops() && !route->flagsCleared()) {
       return false;
     }
@@ -359,9 +374,9 @@ void RouteUpdater::resolve() {
       } else {
         DCHECK(allRouteFlagsCleared(rib));
       }
-      for (auto& rt : rib->getAllNodes()) {
-        if (rt.second->needResolve()) {
-          resolve(rt.second.get(), rib, &ribCloned.second);
+      for (auto& rt : rib->routes()) {
+        if (rt.value()->needResolve()) {
+          resolve(rt.value().get(), rib, &ribCloned.second);
         }
       }
     }
@@ -375,9 +390,9 @@ void RouteUpdater::resolve() {
       } else {
         DCHECK(allRouteFlagsCleared(rib));
       }
-      for (auto& rt : rib->getAllNodes()) {
-        if (rt.second->needResolve()) {
-          resolve(rt.second.get(), rib, &ribCloned.second);
+      for (auto& rt : rib->routes()) {
+        if (rt.value()->needResolve()) {
+          resolve(rt.value().get(), rib, &ribCloned.second);
         }
       }
     }
@@ -447,44 +462,116 @@ void RouteUpdater::addInterfaceAndLinkLocalRoutes(
   }
 }
 
+template<typename StaticRouteType>
+void RouteUpdater::staticRouteDelHelper(
+    const std::vector<StaticRouteType>& oldRoutes,
+    const flat_map<RouterID, flat_set<CIDRNetwork>>& newRoutes) {
+  for (const auto& oldRoute : oldRoutes) {
+    RouterID rid(oldRoute.routerID);
+    auto network = IPAddress::createNetwork(oldRoute.prefix);
+    auto itr = newRoutes.find(rid);
+    if (itr == newRoutes.end() || itr->second.find(network) ==
+        itr->second.end()) {
+      delRoute(rid, network.first, network.second);
+      VLOG(1) << "Unconfigured static route : " << network.first
+        << "/" << (int)network.second;
+    }
+  }
+}
+
+void RouteUpdater::updateStaticRoutes(const cfg::SwitchConfig& curCfg,
+    const cfg::SwitchConfig& prevCfg) {
+  flat_map<RouterID, flat_set<CIDRNetwork>> newCfgVrf2StaticPfxs;
+  auto processStaticRoutesNoNhops = [&](
+      const std::vector<cfg::StaticRouteNoNextHops>& routes,
+      RouteForwardAction action) {
+    for (const auto& route : routes) {
+      RouterID rid(route.routerID) ;
+      auto network = IPAddress::createNetwork(route.prefix);
+      if (newCfgVrf2StaticPfxs[rid].find(network)
+          != newCfgVrf2StaticPfxs[rid].end()) {
+        throw FbossError("Prefix : ",  network.first, "/",
+            (int)network.second, " in multiple static routes");
+      }
+      addRoute(rid, network.first, network.second, action);
+      // Note down prefix for comparing with old static routes
+      newCfgVrf2StaticPfxs[rid].emplace(network);
+    }
+  };
+
+
+  if (curCfg.__isset.staticRoutesToNull) {
+    processStaticRoutesNoNhops(curCfg.staticRoutesToNull, DROP);
+  }
+  if (curCfg.__isset.staticRoutesToCPU) {
+    processStaticRoutesNoNhops(curCfg.staticRoutesToCPU, TO_CPU);
+  }
+
+  if (curCfg.__isset.staticRoutesWithNhops) {
+    for (const auto& route : curCfg.staticRoutesWithNhops) {
+      RouterID rid(route.routerID) ;
+      auto network = IPAddress::createNetwork(route.prefix);
+      RouteNextHops nhops;
+      for (auto& nhopStr : route.nexthops) {
+        nhops.emplace(folly::IPAddress(nhopStr));
+      }
+      addRoute(rid, network.first, network.second, nhops);
+      // Note down prefix for comparing with old static routes
+      newCfgVrf2StaticPfxs[rid].emplace(network);
+    }
+  }
+  // Now blow away any static routes that are not in the config
+  // Ideally after this we should replay the routes from lower
+  // precedence route announcers (e.g. BGP) for deleted prefixes.
+  // The static route may have overridden a existing protocol
+  // route and in that case rather than blowing away the route we
+  // should just replace it - t8910011
+  if (prevCfg.__isset.staticRoutesWithNhops) {
+    staticRouteDelHelper(prevCfg.staticRoutesWithNhops, newCfgVrf2StaticPfxs);
+  }
+  if (prevCfg.__isset.staticRoutesToCPU) {
+    staticRouteDelHelper(prevCfg.staticRoutesToCPU, newCfgVrf2StaticPfxs);
+  }
+  if (prevCfg.__isset.staticRoutesToNull) {
+    staticRouteDelHelper(prevCfg.staticRoutesToNull, newCfgVrf2StaticPfxs);
+  }
+}
+
 template<typename RibT>
 bool RouteUpdater::dedupRoutes(const RibT* oldRib, RibT* newRib) {
   bool isSame = true;
   if (oldRib == newRib) {
     return isSame;
   }
-  const auto& oldRoutes = oldRib->getAllNodes();
-  auto& newRoutes = newRib->writableNodes();
-  auto oldIter = oldRoutes.begin();
-  auto newIter = newRoutes.begin();
-  while (oldIter != oldRoutes.end() && newIter != newRoutes.end()) {
-    const auto& oldPrefix = oldIter->first;
-    const auto& newPrefix = newIter->first;
-    if (oldPrefix < newPrefix) {
+  const auto& oldRoutes = oldRib->routes();
+  auto& newRoutes = newRib->writableRoutes();
+  // Copy routes from old route table if they are
+  // same. For matching prefixes, which don't have
+  // same attributes inherit the generation number
+  for (auto oldIter : oldRoutes) {
+    const auto& oldRt = oldIter->value();
+    auto newIter = newRoutes.exactMatch(oldIter->ipAddress(),
+        oldIter->masklen());
+    if (newIter == newRoutes.end()) {
       isSame = false;
-      oldIter++;
       continue;
     }
-    if (oldPrefix > newPrefix) {
-      isSame = false;
-      newIter++;
-      continue;
-    }
-    const auto& oldRt = oldIter->second;
-    auto& newRt = newIter->second;
+    auto& newRt = newIter->value();
     if (oldRt->isSame(newRt.get())) {
-      // both routes are complete same, instead of using the new route,
+      // both routes are completely same, instead of using the new route,
       // we re-use the old route.
-      newIter->second = oldRt;
+      newIter->value() = oldRt;
     } else {
       isSame = false;
       newRt->inheritGeneration(*oldRt);
     }
-    oldIter++;
-    newIter++;
   }
-  if (oldIter != oldRoutes.end() || newIter != newRoutes.end()) {
+  if (newRoutes.size() != oldRoutes.size()) {
     isSame = false;
+  } else {
+    // If sizes are same we would have already caught any
+    // difference while looking up all routes from oldRoutes
+    // in newRoutes, so do nothing
   }
   return isSame;
 }

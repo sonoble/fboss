@@ -18,6 +18,7 @@ class NeighborUpdaterImpl;
 class SwitchState;
 class StateDelta;
 class Vlan;
+class UnresolvedNhopsProber;
 
 /**
  * This class handles asynchronous updates to neighbor tables that are not
@@ -38,6 +39,8 @@ class NeighborUpdater : public AutoRegisterStateObserver {
   void vlanAdded(const SwitchState* state, const Vlan* vlan);
   void vlanDeleted(const Vlan* vlan);
 
+  void sendNeighborUpdates(const VlanDelta& delta);
+
   // Forbidden copy constructor and assignment operator
   NeighborUpdater(NeighborUpdater const &) = delete;
   NeighborUpdater& operator=(NeighborUpdater const &) = delete;
@@ -48,6 +51,7 @@ class NeighborUpdater : public AutoRegisterStateObserver {
    */
   boost::container::flat_map<VlanID, NeighborUpdaterImpl*> updaters_;
   SwSwitch* sw_{nullptr};
+  UnresolvedNhopsProber* unresolvedNhopsProber_;
 };
 
 }} // facebook::fboss

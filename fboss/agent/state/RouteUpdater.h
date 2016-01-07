@@ -12,6 +12,7 @@
 
 #include "fboss/agent/types.h"
 #include <folly/IPAddress.h>
+#include "fboss/agent/state/RouteForwardInfo.h"
 #include "fboss/agent/state/RouteTypes.h"
 #include "fboss/agent/state/RouteTableMap.h"
 
@@ -19,6 +20,10 @@
 #include <boost/container/flat_set.hpp>
 
 namespace facebook { namespace fboss {
+
+namespace cfg {
+class SwitchConfig;
+}
 
 class InterfaceMap;
 template<typename Addr> class RouteTableRib;
@@ -77,7 +82,14 @@ class RouteUpdater {
   void addLinkLocalRoutes(RouterID id);
   void delLinkLocalRoutes(RouterID id);
 
+  void updateStaticRoutes(const cfg::SwitchConfig& curCfg,
+      const cfg::SwitchConfig& prevCfg);
+
  private:
+  template<typename StaticRouteType>
+  void staticRouteDelHelper(const std::vector<StaticRouteType>& oldRoutes,
+      const boost::container::flat_map<RouterID,
+      boost::container::flat_set<folly::CIDRNetwork>>& newRoutes);
   // Forbidden copy constructor and assignment operator
   RouteUpdater(RouteUpdater const &) = delete;
   RouteUpdater& operator=(RouteUpdater const &) = delete;
@@ -118,7 +130,10 @@ class RouteUpdater {
   void resolve();
   template<typename RouteT, typename RtRibT>
   void resolve(RouteT* rt, RtRibT* rib, ClonedRib* clonedRib);
-
+  template<typename RtRibT, typename AddrT>
+  void getFwdInfoFromNhop(RtRibT* nRib, ClonedRib* ribCloned,
+      const AddrT& nh, bool* hasToCpuNhops, bool* hasDropNhops,
+      RouteForwardNexthops* fwd);
   // Functions to deduplicate routing tables during sync mode
   template<typename RibT>
   bool dedupRoutes(const RibT* origRib, RibT* newRib);

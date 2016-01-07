@@ -19,11 +19,11 @@
 #include "fboss/agent/SwSwitch.h"
 #include "fboss/agent/ThriftHandler.h"
 #include "common/stats/ServiceData.h"
-#include "thrift/lib/cpp/async/TAsyncTimeout.h"
+#include <folly/io/async/AsyncTimeout.h>
 #include <folly/io/async/AsyncSignalHandler.h>
-#include "thrift/lib/cpp/async/TEventBase.h"
-#include "thrift/lib/cpp2/server/ThriftServer.h"
-#include "thrift/lib/cpp/transport/TSocketAddress.h"
+#include <folly/io/async/EventBase.h>
+#include <thrift/lib/cpp2/server/ThriftServer.h>
+#include <folly/SocketAddress.h>
 
 #include <chrono>
 #include <condition_variable>
@@ -38,9 +38,9 @@
 using folly::FunctionScheduler;
 using apache::thrift::ThriftServer;
 using folly::AsyncSignalHandler;
-using apache::thrift::async::TAsyncTimeout;
-using apache::thrift::async::TEventBase;
-using apache::thrift::transport::TSocketAddress;
+using folly::AsyncTimeout;
+using folly::EventBase;
+using folly::SocketAddress;
 using std::shared_ptr;
 using std::unique_ptr;
 using std::mutex;
@@ -53,6 +53,9 @@ DEFINE_int32(stat_publish_interval_ms, 1000,
              "How frequently to publish thread-local stats back to the "
              "global store.  This should generally be less than 1 second.");
 DEFINE_int32(thrift_idle_timeout, 60, "Thrift idle timeout in seconds.");
+// Programming 16K routes can take 20+ seconds
+DEFINE_int32(thrift_task_expire_timeout, 30,
+    "Thrift task expire timeout in seconds.");
 DEFINE_bool(tun_intf, true,
             "Create tun interfaces to allow other processes to "
             "send and receive traffic via the switch ports");
@@ -187,11 +190,11 @@ class Initializer {
   condition_variable initCondition_;
 };
 
-class StatsPublisher : public TAsyncTimeout {
+class StatsPublisher : public AsyncTimeout {
  public:
-  StatsPublisher(TEventBase* eventBase, SwSwitch* sw,
+  StatsPublisher(EventBase* eventBase, SwSwitch* sw,
                  std::chrono::milliseconds interval)
-    : TAsyncTimeout(eventBase),
+    : AsyncTimeout(eventBase),
       sw_(sw),
       interval_(interval) {}
 
@@ -214,7 +217,7 @@ class StatsPublisher : public TAsyncTimeout {
 class SignalHandler : public AsyncSignalHandler {
   typedef std::function<void()> StopServices;
  public:
-  SignalHandler(TEventBase* eventBase, SwSwitch* sw,
+  SignalHandler(EventBase* eventBase, SwSwitch* sw,
       StopServices stopServices) :
     AsyncSignalHandler(eventBase), sw_(sw), stopServices_(stopServices) {
     registerSignalHandler(SIGINT);
@@ -259,16 +262,37 @@ int fbossMain(int argc, char** argv, PlatformInitFn initPlatform) {
   // Create the SwSwitch and thrift handler
   SwSwitch sw(std::move(platform));
   auto platformPtr = sw.getPlatform();
-  auto handler = std::shared_ptr<ThriftHandler>(
-      std::move(platformPtr->createHandler(&sw)));
+  auto handler =
+      std::shared_ptr<ThriftHandler>(platformPtr->createHandler(&sw));
+
+  EventBase eventBase;
+
+  // Start the thrift server
+  ThriftServer server;
+  server.setTaskExpireTime(std::chrono::milliseconds(
+        FLAGS_thrift_task_expire_timeout * 1000));
+  server.getEventBaseManager()->setEventBase(&eventBase, false);
+  server.setInterface(handler);
+  server.setDuplex(true);
+
+  // When a thrift connection closes, we need to clean up the associated
+  // callbacks.
+  server.setServerEventHandler(handler);
+
+  SocketAddress address;
+  address.setFromLocalPort(FLAGS_port);
+  server.setAddress(address);
+  server.setIdleTimeout(std::chrono::seconds(FLAGS_thrift_idle_timeout));
+  handler->setIdleTimeout(FLAGS_thrift_idle_timeout);
+  server.setup();
 
   // Create an Initializer to initialize the switch in a background thread.
-  // This allows us to start the thrift server while initialization is still in
-  // progress.
   Initializer init(&sw, platformPtr);
-  init.start();
 
-  TEventBase eventBase;
+  // At this point, we are guaranteed no other agent process will initialize the
+  // ASIC because such a process would have crashed attempting to bind to the
+  // Thrift port 5909
+  init.start();
 
   // Create a timeout to call sw->publishStats() once every second.
   StatsPublisher statsPublisher(
@@ -281,26 +305,11 @@ int fbossMain(int argc, char** argv, PlatformInitFn initPlatform) {
     init.stopFunctionScheduler();
   };
   SignalHandler signalHandler(&eventBase, &sw, stopServices);
-  // Start the thrift server
-  ThriftServer server;
-  server.getEventBaseManager()->setEventBase(&eventBase, false);
-  server.setInterface(handler);
-  server.setDuplex(true);
 
-  // When a thrift connection closes, we need to clean up the associated
-  // callbacks.
-  server.setServerEventHandler(handler);
-
-  TSocketAddress address;
-  address.setFromLocalPort(FLAGS_port);
-  server.setAddress(address);
-  server.setIdleTimeout(std::chrono::seconds(FLAGS_thrift_idle_timeout));
-  handler->setIdleTimeout(FLAGS_thrift_idle_timeout);
-  server.setup();
   SCOPE_EXIT { server.cleanUp(); };
   LOG(INFO) << "serving on localhost on port " << FLAGS_port;
 
-  // Run the TEventBase main loop
+  // Run the EventBase main loop
   eventBase.loopForever();
 
   return 0;

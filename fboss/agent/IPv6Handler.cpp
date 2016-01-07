@@ -297,7 +297,7 @@ unique_ptr<RxPacket> IPv6Handler::handleICMPv6Packet(
       break;
   }
 
-  return std::move(pkt);
+  return pkt;
 }
 
 void IPv6Handler::handleRouterSolicitation(unique_ptr<RxPacket> pkt,
@@ -308,8 +308,56 @@ void IPv6Handler::handleRouterSolicitation(unique_ptr<RxPacket> pkt,
     return;
   }
 
-  // TODO: process the packet
-  sw_->portStats(pkt)->pktDropped();
+  cursor.skip(4); // 4 reserved bytes
+
+  auto state = sw_->getState();
+  auto vlan = state->getVlans()->getVlanIf(pkt->getSrcVlan());
+  if (!vlan) {
+    sw_->portStats(pkt)->pktDropped();
+    return;
+  }
+
+  auto intf = state->getInterfaces()->getInterfaceIf(vlan->getInterfaceID());
+  if (!intf) {
+    sw_->portStats(pkt)->pktDropped();
+    return;
+  }
+
+  MacAddress dstMac = hdr.src;
+  while (cursor.totalLength() != 0) {
+    auto optionType = cursor.read<uint8_t>();
+    auto optionLength = cursor.read<uint8_t>();
+    if (optionType == NDPOptionType::SRC_LL_ADDRESS) {
+      // target mac address
+      if (optionLength != NDPOptionLength::SRC_LL_ADDRESS_IEEE802) {
+        VLOG(3) << "bad option length " <<
+          static_cast<unsigned int>(optionLength) <<
+          " for source MAC address in IPv6 router solicitation";
+        sw_->portStats(pkt)->pktDropped();
+        return;
+      }
+      dstMac = PktUtil::readMac(&cursor);
+    } else {
+      // Unknown option.  Just skip over it.
+      cursor.skip(optionLength * 8);
+    }
+  }
+
+  // Send the response
+  IPAddressV6 dstIP = hdr.ipv6->srcAddr;
+  if (dstIP.isZero()) {
+    dstIP = IPAddressV6("ff01::1");
+  }
+
+  VLOG(3) << "sending router advertisement in response to solicitation from "
+    << dstIP.str() << " (" << dstMac << ")";
+
+  uint32_t pktLen = IPv6RouteAdvertiser::getPacketSize(intf.get());
+  auto resp = sw_->allocatePacket(pktLen);
+  RWPrivateCursor respCursor(resp->buf());
+  IPv6RouteAdvertiser::createAdvertisementPacket(
+    intf.get(), &respCursor, dstMac, dstIP);
+  sw_->sendPacketSwitched(std::move(resp));
 }
 
 void IPv6Handler::handleRouterAdvertisement(unique_ptr<RxPacket> pkt,
@@ -394,7 +442,7 @@ void IPv6Handler::handleNeighborAdvertisement(unique_ptr<RxPacket> pkt,
   // Check for options fields.  The target MAC address may be specified here.
   // If it isn't, we use the source MAC from the ethernet header.
   MacAddress targetMac = hdr.src;
-  if (cursor.totalLength() != 0) {
+  while (cursor.totalLength() != 0) {
     auto optionType = cursor.read<uint8_t>();
     auto optionLength = cursor.read<uint8_t>();
     if (optionType == NDPOptionType::TARGET_LL_ADDRESS) {
@@ -487,9 +535,11 @@ bool IPv6Handler::checkNdpPacket(const ICMPHeaders& hdr,
 
 void IPv6Handler::sendNeighborSolicitation(
     const folly::IPAddressV6& targetIP,
-    const shared_ptr<Interface> intf,
     const shared_ptr<Vlan> vlan) {
   uint32_t bodyLength = 4 + 16 + 8;
+  auto intf = sw_->getState()->getInterfaces()
+                 ->getInterfaceInVlan(vlan->getID());
+
   auto serializeBody = [&](RWPrivateCursor* cursor) {
     cursor->writeBE<uint32_t>(0); // reserved
     cursor->push(targetIP.bytes(), 16);
@@ -508,7 +558,7 @@ void IPv6Handler::sendNeighborSolicitation(
                              ICMPV6_CODE_NDP_MESSAGE_CODE,
                              bodyLength, serializeBody);
   VLOG(4) << "adding pending NDP entry for " << targetIP;
-  setPendingNdpEntry(intf->getID(), vlan, targetIP);
+  setPendingNdpEntry(vlan, targetIP);
 
 
   VLOG(4) << "sending neighbor solicitation for " << targetIP <<
@@ -546,7 +596,6 @@ void IPv6Handler::sendNeighborSolicitations(
       auto target = route->isConnected() ? targetIP : nh.nexthop.asV6();
       if (source == target) {
         // This packet is for us.  Don't send NDP requests to ourself.
-        // TODO(aeckert): #5478027 make sure we don't solicit any local address.
         continue;
       }
 
@@ -556,7 +605,7 @@ void IPv6Handler::sendNeighborSolicitations(
         auto entry = vlan->getNdpTable()->getEntryIf(target);
         if (entry == nullptr) {
           // No entry in NDP table, create a neighbor solicitation packet
-          sendNeighborSolicitation(target, intf, vlan);
+          sendNeighborSolicitation(target,vlan);
         } else {
           VLOG(5) << "not sending neighbor solicitation for " << target.str()
                   << ", " << ((entry->isPending()) ? "pending" : "")
@@ -613,10 +662,11 @@ void IPv6Handler::sendNeighborAdvertisement(VlanID vlan,
   sw_->sendPacketSwitched(std::move(pkt));
 }
 
-void IPv6Handler::setPendingNdpEntry(InterfaceID intfID,
-                                     shared_ptr<Vlan> vlan,
+void IPv6Handler::setPendingNdpEntry(shared_ptr<Vlan> vlan,
                                      const folly::IPAddressV6 &ip) {
   auto vlanID = vlan->getID();
+  auto intfID = vlan->getInterfaceID();
+
   VLOG(4) << "setting pending entry on vlan " << vlanID << " with ip "
           << ip.str();
 
@@ -683,20 +733,9 @@ void IPv6Handler::updateNeighborEntry(const RxPacket* pkt,
     return;
   }
 
-  // FIXME: Look up the correct interface based on the subnet for this IP.
-  // For now we use the first interface for this VLAN.
-  // We will probably just change the code to only allow a single interface
-  // per VLAN.
-  InterfaceID intfID(0);
-  const auto& intfs = state->getInterfaces();
-  const Interface* intf = nullptr;
-  for (const auto& curIntf : *intfs) {
-    if (curIntf->getVlanID() == vlanID) {
-      intfID = curIntf->getID();
-      intf = curIntf.get();
-      break;
-    }
-  }
+  auto intf = state->getInterfaces()->getInterfaceInVlan(vlan->getID());
+  auto intfID = vlan->getInterfaceID();
+
   if (!intf) {
     // The interface no longer exists. Just ignore the entry update.
     VLOG(1) << "Interface for vlan " << vlanID << " deleted before NDP entry "

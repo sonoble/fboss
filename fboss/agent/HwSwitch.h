@@ -12,6 +12,8 @@
 #include "fboss/agent/HighresCounterUtil.h"
 #include "fboss/agent/types.h"
 #include "fboss/agent/if/gen-cpp2/FbossCtrl.h"
+#include "fboss/agent/gen-cpp/switch_config_types.h"
+
 #include <folly/IPAddress.h>
 
 #include <memory>
@@ -158,6 +160,8 @@ class HwSwitch {
       const folly::StringPiece namespaceString,
       const std::set<folly::StringPiece>& counterSet) = 0;
 
+  virtual void fetchL2Table(std::vector<L2EntryThrift> *l2Table) = 0;
+
   /*
    * Allow hardware to perform any warm boot related cleanup
    * before we exit the application.
@@ -189,12 +193,23 @@ class HwSwitch {
   virtual bool isPortUp(PortID port) const = 0;
 
   /*
+   * Get current port speed.
+   *
+   * Returns -1 if the port is down.
+   */
+  virtual cfg::PortSpeed getPortSpeed(PortID port) const = 0;
+
+  /*
+   * Get max port speed.
+   */
+  virtual cfg::PortSpeed getMaxPortSpeed(PortID port) const = 0;
+
+  /*
    * Returns true if the arp/ndp entry for the passed in ip/intf has been hit
    * since the last call to getAndClearNeighborHit.
    */
   virtual bool getAndClearNeighborHit(RouterID vrf,
                                       folly::IPAddress& ip) = 0;
-
  private:
   // Forbidden copy constructor and assignment operator
   HwSwitch(HwSwitch const &) = delete;

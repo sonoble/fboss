@@ -11,6 +11,7 @@
 
 #include "fboss/agent/HwSwitch.h"
 #include "fboss/agent/types.h"
+#include "fboss/agent/gen-cpp/switch_config_types.h"
 
 #include <memory>
 #include <mutex>
@@ -24,6 +25,8 @@ extern "C" {
 
 namespace facebook { namespace fboss {
 
+struct AclEntryID;
+class AclEntry;
 class ArpEntry;
 class BcmEgress;
 class BcmHostTable;
@@ -31,6 +34,7 @@ class BcmIntfTable;
 class BcmPlatform;
 class BcmPortTable;
 class BcmRouteTable;
+class BcmRxPacket;
 class BcmSwitchEventManager;
 class BcmUnit;
 class BcmWarmBootCache;
@@ -39,6 +43,12 @@ class Port;
 class PortStats;
 class Vlan;
 class VlanMap;
+/*
+ * Map AclEntryId to opennsl_field_entry_t
+ * opennsl_field_entry_t is not opensourced. Using int for now.
+ */
+using BcmAclTable =
+  boost::container::flat_map<AclEntryID, int>;
 
 /*
  * BcmSwitch is a HwSwitch implementation for systems that use a single
@@ -46,6 +56,10 @@ class VlanMap;
  */
 class BcmSwitch : public HwSwitch {
  public:
+   enum HashMode {
+     FULL_HASH, // Full hash - use src IP, dst IP, src port, dst port
+     HALF_HASH  // Half hash - user src IP, dst IP
+   };
   /*
    * Construct a new BcmSwitch.
    *
@@ -53,7 +67,7 @@ class BcmSwitch : public HwSwitch {
    * When init() is called, it will initialize the SDK, then find and
    * initialize the first switching ASIC.
    */
-  explicit BcmSwitch(BcmPlatform* platform);
+  explicit BcmSwitch(BcmPlatform* platform, HashMode hashMode=FULL_HASH);
 
   /*
    * Construct a new BcmSwitch for an existing BCM unit.
@@ -176,6 +190,8 @@ class BcmSwitch : public HwSwitch {
       const folly::StringPiece namespaceString,
       const std::set<folly::StringPiece>& counterSet) override;
 
+  void fetchL2Table(std::vector<L2EntryThrift> *l2Table) override;
+
   BcmHostTable* writableHostTable() const { return hostTable_.get(); }
   BcmWarmBootCache* getWarmBootCache() const {
     return warmBootCache_.get();
@@ -198,6 +214,9 @@ class BcmSwitch : public HwSwitch {
   bool getAndClearNeighborHit(RouterID vrf,
                               folly::IPAddress& ip) override;
 
+  cfg::PortSpeed getPortSpeed(PortID port) const override;
+  cfg::PortSpeed getMaxPortSpeed(PortID port) const override;
+
  private:
   enum Flags : uint32_t {
     RX_REGISTERED = 0x01,
@@ -218,6 +237,7 @@ class BcmSwitch : public HwSwitch {
    */
   std::shared_ptr<SwitchState> getWarmBootSwitchState() const;
 
+  std::unique_ptr<BcmRxPacket> createRxPacket(opennsl_pkt_t* pkt);
   void changePortState(const std::shared_ptr<Port>& oldPort,
                        const std::shared_ptr<Port>& newPort);
   void updateIngressVlan(const std::shared_ptr<Port>& oldPort,
@@ -253,6 +273,12 @@ class BcmSwitch : public HwSwitch {
       const RouterID id, const std::shared_ptr<RouteT>& route);
   void processRemovedRoutes(const StateDelta& delta);
   void processAddedChangedRoutes(const StateDelta& delta);
+
+  void processAclChanges(const StateDelta& delta);
+  void processChangedAcl(const std::shared_ptr<AclEntry>& oldAcl,
+                          const std::shared_ptr<AclEntry>& newAcl);
+  void processAddedAcl(const std::shared_ptr<AclEntry>& acl);
+  void processRemovedAcl(const std::shared_ptr<AclEntry>& acl);
 
   void stateChangedImpl(const StateDelta& delta);
 
@@ -304,6 +330,11 @@ class BcmSwitch : public HwSwitch {
   void dropDhcpPackets();
 
   /*
+   * Create ACL group
+   */
+  void createAclGroup();
+
+  /*
    * Configure rate limiting of packets sent to the CPU.
    */
   void configureRxRateLimiting();
@@ -324,6 +355,22 @@ class BcmSwitch : public HwSwitch {
    */
   void printDiagCmd(const std::string& cmd) const;
 
+  /**
+   * Exports the sdk version we build against.
+   */
+  void exportSdkVersion() const;
+
+  void initFieldProcessor(bool isWarmBoot) const;
+  /*
+   * Cos Q mapping for packets destined to us.
+   * Most often these are matched by next hop self
+   * as the RX reason and we put it into the right
+   * Cos Queue. However if these packets have their
+   * TTL set to 1, that gets precedence and such packets
+   * destined to us get put in low pri cos queue. Fix that.
+   */
+   void configureCosQMappingForLocalInterfaces(const StateDelta& delta) const;
+
   /*
    * Member variables
    */
@@ -332,11 +379,13 @@ class BcmSwitch : public HwSwitch {
   std::unique_ptr<BcmUnit> unitObject_;
   int unit_{-1};
   uint32_t flags_{0};
+  HashMode hashMode_;
   std::unique_ptr<BcmPortTable> portTable_;
   std::unique_ptr<BcmEgress> toCPUEgress_;
   std::unique_ptr<BcmIntfTable> intfTable_;
   std::unique_ptr<BcmHostTable> hostTable_;
   std::unique_ptr<BcmRouteTable> routeTable_;
+  std::unique_ptr<BcmAclTable> aclTable_;
   std::unique_ptr<BcmWarmBootCache> warmBootCache_;
   std::unique_ptr<BcmSwitchEventManager> switchEventManager_;
   std::mutex lock_;

@@ -12,6 +12,7 @@
 #include "fboss/agent/hw/bcm/BcmPlatform.h"
 #include "fboss/agent/types.h"
 #include "fboss/agent/platforms/wedge/WedgeProductInfo.h"
+#include "fboss/agent/platforms/wedge/WedgeI2CBusLock.h"
 
 #include <folly/MacAddress.h>
 #include <boost/container/flat_map.hpp>
@@ -23,8 +24,16 @@ namespace facebook { namespace fboss {
 class BcmSwitch;
 class WedgePort;
 
+
 class WedgePlatform : public BcmPlatform {
  public:
+  enum Mode {
+    WEDGE,
+    LC,
+    FC,
+    WEDGE100
+  };
+
   WedgePlatform();
   ~WedgePlatform() override;
 
@@ -50,11 +59,15 @@ class WedgePlatform : public BcmPlatform {
 
   void initLocalMac();
   std::map<std::string, std::string> loadConfig();
+  void initMode();
+  void initTransceiverMap(SwSwitch* sw);
 
+  Mode mode_;
   folly::MacAddress localMac_;
   std::unique_ptr<BcmSwitch> hw_;
   WedgePortMap ports_;
   WedgeProductInfo productInfo_;
+  std::unique_ptr<WedgeI2CBusLock> wedgeI2CBusLock_;
 };
 
 }} // namespace facebook::fboss

@@ -1,12 +1,12 @@
 #include "fboss/agent/if/gen-cpp2/FbossCtrl.h"
-#include "fboss/agent/if/gen-cpp2/PortStatusListenerClient.h"
+#include "fboss/agent/if/gen-cpp2/NeighborListenerClient.h"
 
 #include <iostream>
 #include <string>
 #include <chrono>
 #include <gflags/gflags.h>
 #include <thrift/lib/cpp2/async/DuplexChannel.h>
-#include <thrift/lib/cpp/transport/TSocketAddress.h>
+#include <folly/SocketAddress.h>
 #include <thrift/lib/cpp2/server/ThriftServer.h>
 #include <thrift/lib/cpp/util/ScopedServerThread.h>
 #include <thrift/lib/cpp/async/TEventBase.h>
@@ -22,14 +22,19 @@ using namespace folly;
 DEFINE_string(host, "", "The host to connect to");
 DEFINE_int32(port, 5909, "The port to connect to");
 
-class PortStatusListenerClientInterface : public PortStatusListenerClientSvIf {
+class NeighborListenerClientInterface : public NeighborListenerClientSvIf {
  public:
-  void async_tm_portStatusChanged(
+  void async_tm_neighboursChanged(
       std::unique_ptr<apache::thrift::HandlerCallback<void>> cb,
-      int32_t id,
-      std::unique_ptr<facebook::fboss::PortStatus> ps) override {
-     std::cout << "Port status changed: " << id << "\n";
-   }
+      std::unique_ptr<std::vector<std::string>> added,
+      std::unique_ptr<std::vector<std::string>> removed) {
+    for (const auto& up : *added) {
+      LOG(INFO) << "neighbour added: " << up << "\n";
+    }
+    for (const auto& down : *removed) {
+      LOG(INFO) << "neighbour added: " << down << "\n";
+    }
+  }
 };
 
 int main(int argc, char **argv) {
@@ -39,20 +44,20 @@ int main(int argc, char **argv) {
   google::InitGoogleLogging(argv[0]);
   google::InstallFailureSignalHandler();
 
-  TSocketAddress addr(FLAGS_host, FLAGS_port, true);
+  SocketAddress addr(FLAGS_host, FLAGS_port, true);
   auto socket = TAsyncSocket::newSocket(&base, addr);
   auto chan =
       std::make_shared<DuplexChannel>(DuplexChannel::Who::CLIENT, socket);
   ThriftServer clients_server(chan->getServerChannel());
   clients_server.setIdleTimeout(std::chrono::milliseconds(0));
   clients_server.setInterface(
-      std::make_shared<PortStatusListenerClientInterface>());
+      std::make_shared<NeighborListenerClientInterface>());
   clients_server.serve();
 
   FbossCtrlAsyncClient client(chan->getClientChannel());
-  client.registerForPortStatusChanged([](ClientReceiveState&& state) {
+  client.registerForNeighborChanged([](ClientReceiveState&& state) {
     PortStatus ps;
-    FbossCtrlAsyncClient::recv_registerForPortStatusChanged(state);
+    FbossCtrlAsyncClient::recv_registerForNeighborChanged(state);
     LOG(INFO) << "registered for port status on " << FLAGS_host << "\n";
   });
 

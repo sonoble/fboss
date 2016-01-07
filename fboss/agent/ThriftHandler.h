@@ -19,7 +19,7 @@
 #include "fboss/agent/types.h"
 #include "fboss/agent/HighresCounterSubscriptionHandler.h"
 #include "fboss/agent/if/gen-cpp2/FbossCtrl.h"
-#include "fboss/agent/if/gen-cpp2/PortStatusListenerClient.h"
+#include "fboss/agent/if/gen-cpp2/NeighborListenerClient.h"
 
 #include <folly/Synchronized.h>
 #include <folly/String.h>
@@ -49,7 +49,7 @@ class ThriftHandler : virtual public FbossCtrlSvIf,
 
   void async_tm_getStatus(ThriftCallback<fb303::cpp2::fb_status> cb) override;
 
-  void async_eb_registerForPortStatusChanged(
+  void async_eb_registerForNeighborChanged(
       ThriftCallback<void> callback) override;
 
   void flushCountersNow() override;
@@ -75,6 +75,10 @@ class ThriftHandler : virtual public FbossCtrlSvIf,
       std::unique_ptr<folly::fbstring> data) override;
   void sendPktHex(int32_t port, int32_t vlan,
       std::unique_ptr<folly::fbstring> hex) override;
+  void txPkt(int32_t port, std::unique_ptr<folly::fbstring> data) override;
+  void txPktL2(std::unique_ptr<folly::fbstring> data) override;
+  void txPktL3(std::unique_ptr<folly::fbstring> payload) override;
+
   int32_t flushNeighborEntry(std::unique_ptr<BinaryAddress> ip,
                              int32_t vlan) override;
 
@@ -94,11 +98,16 @@ class ThriftHandler : virtual public FbossCtrlSvIf,
   void getPortStatus(std::map<int32_t, PortStatus>& status,
                      std::unique_ptr<std::vector<int32_t>> ports)
                      override;
+  void setPortState(int32_t portId, bool enable) override;
   void getInterfaceDetail(InterfaceDetail& interfaceDetails,
                                           int32_t interfaceId) override;
-  void getPortStats(PortStatThrift& portStats, int32_t portId) override;
-  void getAllPortStats(std::map<int32_t, PortStatThrift>& portStats) override;
+  void getPortInfo(PortInfoThrift& portInfo, int32_t portId) override;
+  void getAllPortInfo(std::map<int32_t, PortInfoThrift>& portInfo) override;
+  void getPortStats(PortInfoThrift& portInfo, int32_t portId) override;
+  void getAllPortStats(std::map<int32_t, PortInfoThrift>& portInfo) override;
+  void getRunningConfig(std::string& configStr) override;
   void getArpTable(std::vector<ArpEntryThrift>& arpTable) override;
+  void getL2Table(std::vector<L2EntryThrift>& l2Table) override;
   void getNdpTable(std::vector<NdpEntryThrift>& arpTable) override;
 
   /* returns the product information */
@@ -187,7 +196,7 @@ class ThriftHandler : virtual public FbossCtrlSvIf,
   struct ThreadLocalListener {
     EventBase* eventBase;
     std::unordered_map<const apache::thrift::server::TConnectionContext*,
-                       std::shared_ptr<PortStatusListenerClientAsyncClient>>
+                       std::shared_ptr<NeighborListenerClientAsyncClient>>
         clients;
 
     explicit ThreadLocalListener(EventBase* eb) : eventBase(eb){};
@@ -195,10 +204,12 @@ class ThriftHandler : virtual public FbossCtrlSvIf,
   folly::ThreadLocalPtr<ThreadLocalListener, int> listeners_;
 
   void onPortStatusChanged(PortID id, PortStatus st);
-  void invokePortStatusListeners(
-    ThreadLocalListener* info, PortID port, PortStatus status);
 
-  void fillPortStatistics(PortStatThrift& stats);
+  void invokeNeighborListeners(ThreadLocalListener* info,
+                                std::vector<std::string> added,
+                                std::vector<std::string> deleted);
+
+  void fillPortStats(PortInfoThrift& portInfo);
   Vlan* getVlan(int32_t vlanId);
   Vlan* getVlan(const std::string& vlanName);
   template<typename ADDR_TYPE, typename ADDR_CONVERTER>

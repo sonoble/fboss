@@ -38,11 +38,13 @@
 #include "fboss/agent/hw/bcm/BcmTxPacket.h"
 #include "fboss/agent/hw/bcm/BcmUnit.h"
 #include "fboss/agent/hw/bcm/BcmWarmBootCache.h"
+#include "fboss/agent/state/AclEntry.h"
 #include "fboss/agent/state/ArpEntry.h"
 #include "fboss/agent/state/DeltaFunctions.h"
 #include "fboss/agent/state/Interface.h"
 #include "fboss/agent/state/InterfaceMap.h"
 #include "fboss/agent/state/NodeMapDelta.h"
+#include "fboss/agent/state/NodeMapDelta-defs.h"
 #include "fboss/agent/state/Port.h"
 #include "fboss/agent/state/PortMap.h"
 #include "fboss/agent/state/StateDelta.h"
@@ -87,35 +89,6 @@ enum : uint8_t {
 };
 
 namespace {
-
-/*
- * Get current port speed from BCM SDK and convert to
- * cfg::PortSpeed
- */
-facebook::fboss::cfg::PortSpeed getPortSpeed(int unit, int port) {
-  int portSpeed, maxPortSpeed;
-  using facebook::fboss::cfg::PortSpeed;
-  using facebook::fboss::bcmCheckError;
-  auto ret = opennsl_port_speed_get(unit, port, &portSpeed);
-  bcmCheckError(ret, "failed to get current speed for port", port);
-  ret = opennsl_port_speed_max(unit, port, &maxPortSpeed);
-  bcmCheckError(ret, "failed to get max speed for port", port);
-  if (portSpeed == maxPortSpeed) {
-    return PortSpeed::DEFAULT;
-  } else {
-    // We could just return PortSpeed(portSpeed) here,
-    // but the following switch validates if the value
-    // returned from SDK is sane
-    switch (PortSpeed(portSpeed)) {
-      case PortSpeed::GIGE: return PortSpeed::GIGE;
-      case PortSpeed::XG: return PortSpeed::XG;
-      case PortSpeed::FORTYG: return PortSpeed::FORTYG;
-      case PortSpeed::HUNDREDG: return PortSpeed::HUNDREDG;
-      case PortSpeed::DEFAULT: break;
-    }
-  }
-  LOG(FATAL) << "Invalid port speed : " << portSpeed << " for port: " << port;
-}
 /*
  * Dump map containing switch h/w config as a key, value pair
  * to a file. Create parent directories of file if needed.
@@ -133,13 +106,32 @@ void dumpConfigMap(const facebook::fboss::BcmAPI::HwConfigMap& config,
 }
 
 namespace facebook { namespace fboss {
+/*
+ * Get current port speed from BCM SDK and convert to
+ * cfg::PortSpeed
+ */
+cfg::PortSpeed BcmSwitch::getPortSpeed(PortID port) const {
+  int portSpeed;
+  auto ret = opennsl_port_speed_get(unit_, port, &portSpeed);
+  bcmCheckError(ret, "failed to get current speed for port", port);
+  return cfg::PortSpeed(portSpeed);
+}
 
-BcmSwitch::BcmSwitch(BcmPlatform *platform)
+cfg::PortSpeed BcmSwitch::getMaxPortSpeed(PortID port) const {
+  int maxPortSpeed = 0;
+  auto ret = opennsl_port_speed_max(unit_, port, &maxPortSpeed);
+  bcmCheckError(ret, "failed to get max speed for port", port);
+  return cfg::PortSpeed(maxPortSpeed);
+}
+
+BcmSwitch::BcmSwitch(BcmPlatform *platform, HashMode hashMode)
   : platform_(platform),
+    hashMode_(hashMode),
     portTable_(new BcmPortTable(this)),
     intfTable_(new BcmIntfTable(this)),
     hostTable_(new BcmHostTable(this)),
     routeTable_(new BcmRouteTable(this)),
+    aclTable_(new BcmAclTable()),
     warmBootCache_(new BcmWarmBootCache(this)) {
 
   // Start switch event manager so critical events will be handled.
@@ -150,6 +142,8 @@ BcmSwitch::BcmSwitch(BcmPlatform *platform)
     OPENNSL_SWITCH_EVENT_PARITY_ERROR,
     make_shared<BcmSwitchEventParityErrorCallback>());
   dumpConfigMap(BcmAPI::getHwConfig(), platform->getHwConfigDumpFile());
+
+  exportSdkVersion();
 }
 
 BcmSwitch::BcmSwitch(BcmPlatform *platform, unique_ptr<BcmUnit> unit)
@@ -232,11 +226,19 @@ void BcmSwitch::ecmpHashSetup() {
   bcmCheckError(rv, "failed to set hash seed 1");
 
   // First, field selection:
-  // For both IPv4 and IPv6, select src IP, dst IP, src port, and dst port as
-  // the keys to hash.
-  arg = OPENNSL_HASH_FIELD_SRCL4 | OPENNSL_HASH_FIELD_DSTL4
-    | OPENNSL_HASH_FIELD_IP4SRC_LO | OPENNSL_HASH_FIELD_IP4SRC_HI
+  // For both IPv4 and IPv6, depending on whether this is full mode
+  // or half mode hash we use for hashing either
+  // a) src IP, dst IP, src port, and dst port - full mode
+  // b) src IP and dst IP - half mode
+  // We alternate b/w full and half modes in layers of n/w tiers
+  // So if tier n uses full mode, tier n + 1 would use half mode and
+  // so on. This is done to avoid hash polarization
+  arg = OPENNSL_HASH_FIELD_IP4SRC_LO | OPENNSL_HASH_FIELD_IP4SRC_HI
     | OPENNSL_HASH_FIELD_IP4DST_LO | OPENNSL_HASH_FIELD_IP4DST_HI;
+  if (hashMode_ == FULL_HASH) {
+    // We are using full mode hash, add src, dst ports
+    arg |= OPENNSL_HASH_FIELD_SRCL4 | OPENNSL_HASH_FIELD_DSTL4;
+  }
   rv = opennsl_switch_control_set(unit_, opennslSwitchHashIP4Field0, arg);
   bcmCheckError(rv, "failed to config field selection");
   rv = opennsl_switch_control_set(unit_, opennslSwitchHashIP4Field1, arg);
@@ -252,9 +254,12 @@ void BcmSwitch::ecmpHashSetup() {
       unit_, opennslSwitchHashIP4TcpUdpPortsEqualField1, arg);
   bcmCheckError(rv, "failed to config field selection");
   // v6
-  arg = OPENNSL_HASH_FIELD_SRCL4 | OPENNSL_HASH_FIELD_DSTL4
-    | OPENNSL_HASH_FIELD_IP6SRC_LO | OPENNSL_HASH_FIELD_IP6SRC_HI
+  arg = OPENNSL_HASH_FIELD_IP6SRC_LO | OPENNSL_HASH_FIELD_IP6SRC_HI
     | OPENNSL_HASH_FIELD_IP6DST_LO | OPENNSL_HASH_FIELD_IP6DST_HI;
+  if (hashMode_ == FULL_HASH) {
+    // We are using full mode hash, add src, dst ports
+    arg |= OPENNSL_HASH_FIELD_SRCL4 | OPENNSL_HASH_FIELD_DSTL4;
+  }
   rv = opennsl_switch_control_set(unit_, opennslSwitchHashIP6Field0, arg);
   bcmCheckError(rv, "failed to config field selection");
   rv = opennsl_switch_control_set(unit_, opennslSwitchHashIP6Field1, arg);
@@ -354,7 +359,17 @@ std::shared_ptr<SwitchState> BcmSwitch::getWarmBootSwitchState() const {
     auto ret = opennsl_port_enable_get(unit_, port->getID(), &portEnabled);
     bcmCheckError(ret, "Failed to get current state for port", port->getID());
     port->setState(portEnabled == 1 ? cfg::PortState::UP: cfg::PortState::DOWN);
-    port->setSpeed(getPortSpeed(unit_, port->getID()));
+
+    auto speed = getPortSpeed(port->getID());
+    auto maxSpeed = getMaxPortSpeed(port->getID());
+    if (speed == maxSpeed) {
+      speed = cfg::PortSpeed::DEFAULT;
+    } else if (speed > maxSpeed) {
+      LOG(FATAL) << "Invalid port speed:" << (int) speed << " for port:" << port
+                 << " max:" << (int) maxSpeed;
+    }
+    port->setSpeed(speed);
+    port->setMaxSpeed(maxSpeed);
   }
   warmBootState->resetIntfs(warmBootCache_->reconstructInterfaceMap());
   warmBootState->resetVlans(warmBootCache_->reconstructVlanMap());
@@ -427,6 +442,9 @@ BcmSwitch::init(Callback* callback) {
   // Setup hash functions for ECMP
   ecmpHashSetup();
 
+  initFieldProcessor(warmBoot);
+
+  createAclGroup();
   dropDhcpPackets();
   dropIPv6RAs();
   configureRxRateLimiting();
@@ -586,8 +604,13 @@ void BcmSwitch::stateChangedImpl(const StateDelta& delta) {
   // Add all new interfaces
   forEachAdded(delta.getIntfsDelta(), &BcmSwitch::processAddedIntf, this);
 
+  configureCosQMappingForLocalInterfaces(delta);
+
   // Any ARP changes
   processArpChanges(delta);
+
+  // Any ACL changes
+  processAclChanges(delta);
 
   // Process any new routes or route changes
   processAddedChangedRoutes(delta);
@@ -694,14 +717,14 @@ void BcmSwitch::updatePortSpeed(const std::shared_ptr<Port>& oldPort,
     ret = opennsl_port_speed_max(unit_, bcmPort, &speed);
     bcmCheckError(ret, "failed to get max speed for port", newPort->getID());
     break;
+  case cfg::PortSpeed::HUNDREDG:
+  case cfg::PortSpeed::FIFTYG:
   case cfg::PortSpeed::FORTYG:
-    speed = 40000;
-    break;
+  case cfg::PortSpeed::TWENTYFIVEG:
+  case cfg::PortSpeed::TWENTYG:
   case cfg::PortSpeed::XG:
-    speed = 10000;
-    break;
   case cfg::PortSpeed::GIGE:
-    speed = 1000;
+    speed = static_cast<int>(newPort->getSpeed());
     break;
   default:
     throw FbossError("Unsupported speed (", newPort->getSpeed(),
@@ -891,6 +914,15 @@ void BcmSwitch::processRemovedIntf(const shared_ptr<Interface>& intf) {
   intfTable_->deleteIntf(intf);
 }
 
+void BcmSwitch::processAclChanges(const StateDelta& delta) {
+  forEachChanged(
+    delta.getAclsDelta(),
+    &BcmSwitch::processChangedAcl,
+    &BcmSwitch::processAddedAcl,
+    &BcmSwitch::processRemovedAcl,
+    this);
+}
+
 template<typename DELTA>
 void BcmSwitch::processNeighborEntryDelta(const DELTA& delta) {
   const auto* oldEntry = delta.getOld().get();
@@ -930,8 +962,12 @@ void BcmSwitch::processNeighborEntryDelta(const DELTA& delta) {
             << " to " << newEntry->getMac().toString();
     getIntfAndVrf(newEntry->getIntfID());
     auto host = hostTable_->getBcmHost(vrf, IPAddress(newEntry->getIP()));
-    host->program(intf->getBcmIfId(), newEntry->getMac(),
-                  getPortTable()->getBcmPortId(newEntry->getPort()));
+    if (newEntry->isPending()) {
+      host->programToDrop(intf->getBcmIfId());
+    } else {
+      host->program(intf->getBcmIfId(), newEntry->getMac(),
+          getPortTable()->getBcmPortId(newEntry->getPort()));
+    }
   }
 }
 
@@ -1063,7 +1099,7 @@ opennsl_rx_t BcmSwitch::packetRxCallback(int unit, opennsl_pkt_t* pkt,
 opennsl_rx_t BcmSwitch::packetReceived(opennsl_pkt_t* pkt) noexcept {
   unique_ptr<BcmRxPacket> bcmPkt;
   try {
-    bcmPkt = make_unique<BcmRxPacket>(pkt);
+    bcmPkt = createRxPacket(pkt);
   } catch (const std::exception& ex) {
     LOG(ERROR) << "failed to allocated BcmRxPacket for receive handling: " <<
       folly::exceptionStr(ex);

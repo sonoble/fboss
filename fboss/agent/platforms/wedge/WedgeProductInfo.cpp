@@ -14,7 +14,6 @@
 #include <folly/dynamic.h>
 #include <folly/MacAddress.h>
 
-
 namespace {
 constexpr auto kInfo = "Information";
 constexpr auto kSysMfgDate = "System Manufacturing Date";
@@ -36,6 +35,9 @@ constexpr auto kExtMacSize = "Extended MAC Address Size";
 constexpr auto kExtMacBase = "Extended MAC Base";
 constexpr auto kLocalMac = "Local MAC";
 constexpr auto kVersion = "Version";
+constexpr auto kFabricLocation = "Location on Fabric";
+constexpr auto kFabricLocationLeft = "LEFT";
+constexpr auto kFabricLocationRight = "RIGHT";
 }
 
 namespace facebook { namespace fboss {
@@ -50,49 +52,67 @@ WedgeProductInfo::WedgeProductInfo(StringPiece path)
 }
 
 void WedgeProductInfo::initialize() {
-  std::string data;
-  folly::readFile(path_.str().c_str(), data);
-  parse(data);
+  try {
+    std::string data;
+    folly::readFile(path_.str().c_str(), data);
+    parse(data);
+  } catch (const std::exception& err) {
+    LOG(ERROR) << err.what();
+    // if fruid info fails fall back to hostname
+    initFromHostname();
+  }
 }
 
 void WedgeProductInfo::getInfo(ProductInfo& info) {
   info = productInfo_;
 }
 
+std::string WedgeProductInfo::getFabricLocation() {
+  return productInfo_.fabricLocation;
+}
+
+std::string WedgeProductInfo::getProductName() {
+  return productInfo_.product;
+}
+
 void WedgeProductInfo::parse(std::string data) {
-  try {
-    dynamic info = parseJson(data)[kInfo];
-    productInfo_.oem = folly::to<std::string>(info[kSysMfg].asString());
-    productInfo_.product = folly::to<std::string>(info[kProdName].asString());
-    productInfo_.serial = folly::to<std::string>(info[kSerialNum].asString());
-    productInfo_.mfgDate = folly::to<std::string>(info[kSysMfgDate].asString());
-    productInfo_.systemPartNumber =
+  dynamic info = parseJson(data)[kInfo];
+  productInfo_.oem = folly::to<std::string>(info[kSysMfg].asString());
+  productInfo_.product = folly::to<std::string>(info[kProdName].asString());
+  productInfo_.serial = folly::to<std::string>(info[kSerialNum].asString());
+  productInfo_.mfgDate = folly::to<std::string>(info[kSysMfgDate].asString());
+  productInfo_.systemPartNumber =
                       folly::to<std::string>(info[kSysAmbPartNum].asString());
-    productInfo_.assembledAt = folly::to<std::string>(info[kAmbAt].asString());
-    productInfo_.pcbManufacturer =
+  productInfo_.assembledAt = folly::to<std::string>(info[kAmbAt].asString());
+  productInfo_.pcbManufacturer =
                               folly::to<std::string>(info[kPcbMfg].asString());
-    productInfo_.assetTag =
+  productInfo_.assetTag =
                         folly::to<std::string>(info[kProdAssetTag].asString());
-    productInfo_.partNumber =
+  productInfo_.partNumber =
                           folly::to<std::string>(info[kProdPartNum].asString());
-    productInfo_.odmPcbPartNumber = folly::to<std::string>
+  productInfo_.odmPcbPartNumber = folly::to<std::string>
                                     (info[kOdmPcbPartNum].asString());
-    productInfo_.odmPcbSerial = folly::to<std::string>
+  productInfo_.odmPcbSerial = folly::to<std::string>
                                   (info[kOdmPcbSerialNum].asString());
-    productInfo_.fbPcbPartNumber = folly::to<std::string>
+  productInfo_.fbPcbPartNumber = folly::to<std::string>
                                     (info[kFbPcbPartNum].asString());
-    productInfo_.version = info[kVersion].asInt();
-    productInfo_.subVersion = info[kSubVersion].asInt();
-    productInfo_.productionState = info[kProductionState].asInt();
-    productInfo_.productVersion = info[kProdVersion].asInt();
-    productInfo_.bmcMac = folly::to<std::string>(info[kLocalMac].asString());
-    productInfo_.mgmtMac = folly::to<std::string>(info[kExtMacBase].asString());
-    auto macBase = MacAddress(info[kExtMacBase].asString()).u64HBO() + 1;
-    productInfo_.macRangeStart = MacAddress::fromHBO(macBase).toString();
-    productInfo_.macRangeSize = info[kExtMacSize].asInt() - 1;
-  } catch (const std::exception& err) {
-    LOG(ERROR) << err.what();
+  productInfo_.fabricLocation = folly::to<std::string>
+                                    (info[kFabricLocation].asString());
+  // Append L/R to the serial number based on the fabricLocation
+  if (productInfo_.fabricLocation == kFabricLocationLeft) {
+    productInfo_.serial = productInfo_.serial + "L";
+  } else if (productInfo_.fabricLocation == kFabricLocationRight) {
+    productInfo_.serial = productInfo_.serial + "R";
   }
+  productInfo_.version = info[kVersion].asInt();
+  productInfo_.subVersion = info[kSubVersion].asInt();
+  productInfo_.productionState = info[kProductionState].asInt();
+  productInfo_.productVersion = info[kProdVersion].asInt();
+  productInfo_.bmcMac = folly::to<std::string>(info[kLocalMac].asString());
+  productInfo_.mgmtMac = folly::to<std::string>(info[kExtMacBase].asString());
+  auto macBase = MacAddress(info[kExtMacBase].asString()).u64HBO() + 1;
+  productInfo_.macRangeStart = MacAddress::fromHBO(macBase).toString();
+  productInfo_.macRangeSize = info[kExtMacSize].asInt() - 1;
 }
 
 }} // facebook::fboss

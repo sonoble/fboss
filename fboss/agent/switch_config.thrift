@@ -44,8 +44,19 @@ enum PortSpeed {
   DEFAULT = 0;                  // Default for that port defined by HW
   GIGE = 1000;                  // Gig Ethernet
   XG = 10000;                   // 10G
+  TWENTYG = 20000;              // 20G
+  TWENTYFIVEG = 25000;          // 25G
   FORTYG = 40000;               // 40G
+  FIFTYG = 50000;               // 50G
   HUNDREDG = 100000;            // 100G
+}
+
+/**
+ * The action for an access control entry
+ */
+enum AclAction {
+  DENY = 0,
+  PERMIT = 1,
 }
 
 /**
@@ -97,6 +108,11 @@ struct Port {
    */
   9: optional string name
 
+  /**
+   * An optional configurable string describing the port.
+   */
+  10: optional string description
+
    /**
     * DEPRECATED: Old versions of the switch didn't support multiple
     * MTUs. Since this field is non-optional, we keep it for compatibility.
@@ -143,6 +159,8 @@ struct Vlan {
   9: optional map<string, string> dhcpRelayOverridesV4
   10: optional map<string, string> dhcpRelayOverridesV6
 
+  /* Interface ID associated with the vlan */
+  11: optional i32 intfID
 }
 
 /**
@@ -248,6 +266,65 @@ struct Interface {
   8: optional i32 mtu
 }
 
+struct StaticRouteWithNextHops {
+  /** The VRF where the static route belongs to */
+  1: i32 routerID = 0
+  /* Prefix in the format like 10.0.0.0/8 */
+  2: string prefix
+  /* IP Address next hops like 1.1.1.1 */
+  3: list<string> nexthops
+}
+
+struct StaticRouteNoNextHops {
+  /** The VRF where the static route belongs to */
+  1: i32 routerID = 0
+  /* Prefix in the format like 10.0.0.0/8 */
+  2: string prefix
+}
+
+/**
+ * An access control entry
+ */
+struct AclEntry {
+  /**
+   * Unique identifier of an AclEntry. Entries with smaller ID will have
+   * higher priority (matched first). Please make sure all AclEntry has a unique
+   * ID so that they can be totally ordered.
+   */
+  1: i32 id
+
+  /**
+   * Actions to take
+   */
+  2: AclAction action
+
+  /**
+   * IP addresses with mask. e.g. 192.168.0.0/16. Can be either V4 or V6
+   */
+  3: optional string srcIp
+  4: optional string dstIp
+
+  /**
+   * L4 ports (TCP/UDP). Note that this is NOT the switch port.
+   */
+  5: optional i16 l4SrcPort
+  6: optional i16 l4DstPort
+
+  /**
+   * IP Protocol. e.g, 6 for TCP
+   */
+  7: optional i16 proto
+
+  /**
+   * TCP flags and mask (to support "don't care" bits). As in IP address,
+   * mask = 1 means we _care_ about this bit position.
+   * Example: tcpFlags = 16, tcpFlagsMask = 16 means ACK set, while ignoring
+   * all other bits
+   */
+  8: optional i16 tcpFlags
+  9: optional i16 tcpFlagsMask
+}
+
 /**
  * The configuration for a switch.
  *
@@ -274,4 +351,13 @@ struct SwitchConfig {
   10: bool proactiveArp = 0
   // The MAC address to use for the switch CPU.
   11: optional string cpuMAC
+  // Static routes with next hops
+  12: optional list<StaticRouteWithNextHops> staticRoutesWithNhops;
+  // Prefixes for which to drop traffic
+  13: optional list<StaticRouteNoNextHops> staticRoutesToNull;
+  // Prefixes for which to send traffic to CPU
+  14: optional list<StaticRouteNoNextHops> staticRoutesToCPU;
+  // The order of AclEntry does _not_ determine its priority.
+  // Highest priority entry comes with smallest ID.
+  15: optional list<AclEntry> acls = []
 }

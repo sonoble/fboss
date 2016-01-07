@@ -67,7 +67,45 @@ facebook::fboss::PortStatus fillInPortStatus(
   status.enabled = (port.getState() ==
       facebook::fboss::cfg::PortState::UP ? true : false);
   status.up = sw->isPortUp(port.getID());
+
+  try {
+    auto tm = sw->getTransceiverMapping(port.getID());
+    status.transceiverIdx.channelId = tm.first;
+    status.transceiverIdx.transceiverId = tm.second;
+    status.__isset.transceiverIdx = true;
+    status.present = sw->getTransceiver(tm.second)->isPresent();
+    status.__isset.present = true;
+  } catch (const facebook::fboss::FbossError& err) {
+    // No problem, we just don't set the other info
+  }
   return status;
+}
+
+string getPortUpName(const shared_ptr<facebook::fboss::Port>& port) {
+  return port->getName().empty()
+    ? folly::to<string>("port", port->getID(), ".up")
+    : port->getName() + ".up";
+}
+
+inline void updatePortStatusCounters(const facebook::fboss::StateDelta& delta) {
+  facebook::fboss::DeltaFunctions::forEachChanged(
+    delta.getPortsDelta(),
+    [&] (const shared_ptr<facebook::fboss::Port>& oldPort,
+         const shared_ptr<facebook::fboss::Port>& newPort) {
+      if (oldPort->getName() == newPort->getName()) {
+        return;
+      }
+      long val = facebook::fbData->getCounter(getPortUpName(oldPort));
+      facebook::fbData->clearCounter(getPortUpName(oldPort));
+      facebook::fbData->setCounter(getPortUpName(newPort), val);
+    },
+    [&] (const shared_ptr<facebook::fboss::Port>& newPort) {
+      facebook::fbData->setCounter(getPortUpName(newPort), 0);
+    },
+    [&] (const shared_ptr<facebook::fboss::Port>& oldPort) {
+      facebook::fbData->clearCounter(getPortUpName(oldPort));
+    }
+  );
 }
 }
 
@@ -174,7 +212,6 @@ void SwSwitch::gracefulExit() {
     // Cleanup if we ever initialized
     hw_->gracefulExit();
   }
-  exit(0);
 }
 
 void SwSwitch::getProductInfo(ProductInfo& productInfo) const {
@@ -198,10 +235,21 @@ bool SwSwitch::isPortUp(PortID port) const {
    return false;
 }
 
-void SwSwitch::registerPortStatusListener(
-    std::function<void(PortID, const PortStatus)> callback) {
-  lock_guard<mutex> g(portListenerMutex_);
-  portListener_ = callback;
+void SwSwitch::registerNeighborListener(
+    std::function<void(const std::vector<std::string>& added,
+                       const std::vector<std::string>& deleted)> callback) {
+  VLOG(2) << "Registering neighbor listener";
+  lock_guard<mutex> g(neighborListenerMutex_);
+  neighborListener_ = std::move(callback);
+}
+
+void SwSwitch::invokeNeighborListener(
+    const std::vector<std::string>& added,
+    const std::vector<std::string>& removed) {
+  lock_guard<mutex> g(neighborListenerMutex_);
+  if (neighborListener_) {
+    neighborListener_(added, removed);
+  }
 }
 
 bool SwSwitch::getAndClearNeighborHit(RouterID vrf, folly::IPAddress ip) {
@@ -227,6 +275,12 @@ void SwSwitch::init(SwitchFlags flags) {
   VLOG(0) << "hardware initialized in " <<
     (initDuration.count() / 1000.0) << " seconds; applying initial config";
 
+  for (const auto& port : (*initialState->getPorts())) {
+    auto maxSpeed = getMaxPortSpeed(port->getID());
+    fbData->setCounter(getPortUpName(port), 0);
+    port->setMaxSpeed(maxSpeed);
+  }
+
   // Store the initial state
   initialState->publish();
   setStateInternal(initialState);
@@ -247,7 +301,7 @@ void SwSwitch::init(SwitchFlags flags) {
   startThreads();
 
   if (flags & SwitchFlags::PUBLISH_BOOTTYPE) {
-    publishBootType();
+    publishBootInfo();
   }
 
   if (flags & SwitchFlags::ENABLE_LLDP) {
@@ -338,7 +392,7 @@ void SwSwitch::notifyStateObservers(const StateDelta& delta) {
     // Make sure the SwSwitch is not already being destroyed
     return;
   }
-
+  updatePortStatusCounters(delta);
   for (auto observerName : stateObservers_) {
     try {
       auto observer = observerName.first;
@@ -576,6 +630,14 @@ map<int32_t, PortStatus> SwSwitch::getPortStatus() {
   return statusMap;
 }
 
+cfg::PortSpeed SwSwitch::getPortSpeed(PortID port) const {
+  return hw_->getPortSpeed(port);
+}
+
+cfg::PortSpeed SwSwitch::getMaxPortSpeed(PortID port) const {
+  return hw_->getMaxPortSpeed(port);
+}
+
 PortStatus SwSwitch::getPortStatus(PortID port) {
   return fillInPortStatus(*getState()->getPort(port), this);
 }
@@ -663,6 +725,16 @@ SwitchStats* SwSwitch::createSwitchStats() {
   return s;
 }
 
+void SwSwitch::setPortStatusCounter(PortID port, bool up) {
+  auto state = getState();
+  if (!state) {
+    // Make sure the state actually exists, this could be an issue if
+    // called during initialization
+    return;
+  }
+  fbData->setCounter(getPortUpName(state->getPort(port)), int(up));
+}
+
 void SwSwitch::packetReceived(std::unique_ptr<RxPacket> pkt) noexcept {
   PortID port = pkt->getSrcPort();
   try {
@@ -717,7 +789,8 @@ void SwSwitch::handlePacket(std::unique_ptr<RxPacket> pkt) {
     " length=" << len <<
     " src=" << srcMac <<
     " dst=" << dstMac <<
-    " ethertype=0x" << std::hex << ethertype;
+    " ethertype=0x" << std::hex << ethertype <<
+    " :: " << pkt->describeDetails();
 
   switch (ethertype) {
   case ArpHandler::ETHERTYPE_ARP:
@@ -745,17 +818,42 @@ void SwSwitch::handlePacket(std::unique_ptr<RxPacket> pkt) {
 }
 
 void SwSwitch::linkStateChanged(PortID port, bool up) noexcept {
-  LOG(INFO) << "link state changed: " << port << " enabled = " << up;
-  lock_guard<mutex> g(portListenerMutex_);
-  if (!portListener_) {
-    return;
-  }
+  logLinkStateEvent(port, up);
+  setPortStatusCounter(port, up);
+
   // It seems that this function can get called before the state is fully
   // initialized. Don't do anything if so.
-  if (isFullyInitialized()) {
-    auto state = getState();
-    portListener_(port, fillInPortStatus(*state->getPort(port), this));
+  //
+  // With some server NICs we see link flaps on warm boot (task #9062918).
+  // We need to track down the root cause of these flaps.  As a hack until the
+  // root cause is fixed, don't drop neighbor entries on link flaps that occur
+  // before the FIB is synced.  This minimizes the traffic disruption caused by
+  // these warm boot link flaps.
+  // Once the link flaps issue is fixed, we can replace !isFibSynced() with
+  // !isFullyInitialized() again.
+  //
+  if (!isFibSynced() || up) {
+    return;
   }
+  updateState("port down",
+              [=](const std::shared_ptr<SwitchState>& state) {
+    bool modified = false;
+    shared_ptr<SwitchState> newState{state};
+    for (const auto& vlanAutoPtr : *state->getVlans()) {
+      auto vlan = vlanAutoPtr.get();
+      auto arpTable = vlan->getArpTable().get();
+      auto newArpTable = arpTable->modify(&vlan, &newState);
+      if (newArpTable->setEntriesPendingForPort(port)) {
+        modified = true;
+      }
+      auto ndpTable = vlan->getNdpTable().get();
+      auto newNdpTable = ndpTable->modify(&vlan, &newState);
+      if (newNdpTable->setEntriesPendingForPort(port)) {
+        modified = true;
+      }
+    }
+    return modified ? newState : nullptr;
+  });
 }
 
 void SwSwitch::startThreads() {
@@ -812,7 +910,7 @@ std::unique_ptr<TxPacket> SwSwitch::allocateL3TxPacket(uint32_t l3Len) {
   buf->clear();
   // reserve for l2 header
   buf->advance(l2Len);
-  return std::move(pkt);
+  return pkt;
 }
 
 void SwSwitch::sendPacketOutOfPort(std::unique_ptr<TxPacket> pkt,
@@ -915,14 +1013,21 @@ void SwSwitch::applyConfig(const std::string& reason) {
       reason,
       [&](const shared_ptr<SwitchState>& state) {
         std::string configFilename = FLAGS_config;
+        std::pair<shared_ptr<SwitchState>, std::string> rval;
         if (!configFilename.empty()) {
           LOG(INFO) << "Loading config from local config file "
                     << configFilename;
-          return applyThriftConfigFile(state, configFilename, platform_.get());
+          rval = applyThriftConfigFile(state, configFilename, platform_.get(),
+              &curConfig_);
+        } else {
+          // Loading config from default location. The message will be printed
+          // there.
+          rval = applyThriftConfigDefault(state, platform_.get(),
+              &curConfig_);
         }
-        // Loading config from default location. The message will be printed
-        // there.
-        return applyThriftConfigDefault(state, platform_.get());
+        curConfigStr_ = rval.second;
+        curConfig_.readFromJson(curConfigStr_.c_str());
+        return rval.first;
       });
   return;
 }

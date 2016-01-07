@@ -45,6 +45,7 @@ unique_ptr<SwSwitch> setupSwitch() {
   cfg::Vlan thriftVlan;
   thriftVlan.name = "Vlan1";
   thriftVlan.id = 1;
+  thriftVlan.intfID = 1;
   thriftVlan.routable = true;
   thriftVlan.ipAddresses = {"10.0.0.1"};
   thriftVlan.dhcpRelayAddressV4 = "10.1.2.3";
@@ -90,7 +91,7 @@ unique_ptr<SwSwitch> setupSwitch() {
       });
   sw->initialConfigApplied();
 
-  return std::move(sw);
+  return sw;
 }
 
 } // unnamed namespace

@@ -43,17 +43,24 @@ namespace facebook { namespace fboss {
 shared_ptr<SwitchState> publishAndApplyConfig(
     shared_ptr<SwitchState>& state,
     const cfg::SwitchConfig* config,
-    const Platform* platform) {
+    const Platform* platform,
+    const cfg::SwitchConfig* prevCfg) {
   state->publish();
-  return applyThriftConfig(state, config, platform);
+  return applyThriftConfig(state, config, platform, prevCfg);
 }
 
 shared_ptr<SwitchState> publishAndApplyConfigFile(
     shared_ptr<SwitchState>& state,
     StringPiece path,
-    const Platform* platform) {
+    const Platform* platform,
+    std::string prevConfigStr) {
   state->publish();
-  return applyThriftConfigFile(state, path, platform);
+  // Parse the prev JSON config.
+  cfg::SwitchConfig prevConfig;
+  if (prevConfigStr.size()) {
+    prevConfig.readFromJson(prevConfigStr.c_str());
+  }
+  return applyThriftConfigFile(state, path, platform, &prevConfig).first;
 }
 
 unique_ptr<SwSwitch> createMockSw(const shared_ptr<SwitchState>& state) {
@@ -158,6 +165,8 @@ shared_ptr<SwitchState> testStateA() {
   addrs1.emplace(IPAddress("2401:db00:2110:3001::0001"), 64);
   intf1->setAddresses(addrs1);
   state->addIntf(intf1);
+  vlan1->setInterfaceID(InterfaceID(1));
+
   // Add Interface 55 to VLAN 55
   auto intf55 = make_shared<Interface>
     (InterfaceID(55), RouterID(0), VlanID(55),
@@ -168,6 +177,8 @@ shared_ptr<SwitchState> testStateA() {
   addrs55.emplace(IPAddress("2401:db00:2110:3055::0001"), 64);
   intf55->setAddresses(addrs55);
   state->addIntf(intf55);
+  vlan55->setInterfaceID(InterfaceID(55));
+
 
   RouteUpdater updater(state->getRouteTables());
   updater.addInterfaceAndLinkLocalRoutes(state->getInterfaces());

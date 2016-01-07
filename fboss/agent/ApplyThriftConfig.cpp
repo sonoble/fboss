@@ -12,12 +12,15 @@
 #include <folly/FileUtil.h>
 #include "fboss/agent/FbossError.h"
 #include "fboss/agent/Platform.h"
+#include "fboss/agent/state/AclEntry.h"
+#include "fboss/agent/state/AclMap.h"
 #include "fboss/agent/state/ArpResponseTable.h"
 #include "fboss/agent/state/Interface.h"
 #include "fboss/agent/state/InterfaceMap.h"
 #include "fboss/agent/state/NdpResponseTable.h"
 #include "fboss/agent/state/Port.h"
 #include "fboss/agent/state/PortMap.h"
+#include "fboss/agent/state/RouteTypes.h"
 #include "fboss/agent/state/SwitchState.h"
 #include "fboss/agent/state/Vlan.h"
 #include "fboss/agent/state/VlanMap.h"
@@ -37,6 +40,7 @@ using folly::IPAddressV4;
 using folly::IPAddressFormatException;
 using folly::MacAddress;
 using folly::StringPiece;
+using folly::CIDRNetwork;
 using std::make_shared;
 using std::shared_ptr;
 
@@ -54,10 +58,12 @@ class ThriftConfigApplier {
  public:
   ThriftConfigApplier(const std::shared_ptr<SwitchState>& orig,
                       const cfg::SwitchConfig* config,
-                      const Platform* platform)
+                      const Platform* platform,
+                      const cfg::SwitchConfig* prevCfg)
     : orig_(orig),
       cfg_(config),
-      platform_(platform) {}
+      platform_(platform),
+      prevCfg_(prevCfg) {}
 
   std::shared_ptr<SwitchState> run();
 
@@ -100,10 +106,16 @@ class ThriftConfigApplier {
   std::shared_ptr<Vlan> createVlan(const cfg::Vlan* config);
   std::shared_ptr<Vlan> updateVlan(const std::shared_ptr<Vlan>& orig,
                                    const cfg::Vlan* config);
+  std::shared_ptr<AclMap> updateAcls();
+  std::shared_ptr<AclEntry> createAcl(const cfg::AclEntry* config);
+  std::shared_ptr<AclEntry> updateAcl(const std::shared_ptr<AclEntry>& orig,
+                                      const cfg::AclEntry* config);
   bool updateNeighborResponseTables(Vlan* vlan, const cfg::Vlan* config);
   bool updateDhcpOverrides(Vlan* vlan, const cfg::Vlan* config);
   std::shared_ptr<InterfaceMap> updateInterfaces();
-  std::shared_ptr<RouteTableMap> updateRouteTables();
+  std::shared_ptr<RouteTableMap> updateInterfaceRoutes();
+  std::shared_ptr<RouteTableMap> updateStaticRoutes(
+      const std::shared_ptr<RouteTableMap>& curRoutingTables);
   shared_ptr<Interface> createInterface(const cfg::Interface* config,
                                         const Interface::Addresses& addrs);
   shared_ptr<Interface> updateInterface(const shared_ptr<Interface>& orig,
@@ -116,6 +128,7 @@ class ThriftConfigApplier {
   std::shared_ptr<SwitchState> orig_;
   const cfg::SwitchConfig* cfg_{nullptr};
   const Platform* platform_{nullptr};
+  const cfg::SwitchConfig* prevCfg_{nullptr};
 
   struct VlanIpInfo {
     VlanIpInfo(uint8_t mask, MacAddress mac, InterfaceID intf)
@@ -170,26 +183,23 @@ shared_ptr<SwitchState> ThriftConfigApplier::run() {
     }
   }
 
-  // Note: updateInterfaces() must be called before updateRouteTables(),
+  // Note: updateInterfaces() must be called before updateInterfaceRoutes(),
   // as updateInterfaces() populates the intfRouteTables_ data structure.
   {
-    auto newTables = updateRouteTables();
+    auto newTables = updateInterfaceRoutes();
     if (newTables) {
-      newState->resetRouteTables(std::move(newTables));
+      newState->resetRouteTables(newTables);
+      changed = true;
+    }
+    auto newerTables = updateStaticRoutes(newTables ? newTables :
+        orig_->getRouteTables());
+    if (newerTables) {
+      newState->resetRouteTables(std::move(newerTables));
       changed = true;
     }
   }
 
-  // Make sure all interfaces refer to valid VLANs.
   auto newVlans = newState->getVlans();
-  for (const auto& vlanInfo : vlanInterfaces_) {
-    if (newVlans->getVlanIf(vlanInfo.first) == nullptr) {
-      throw FbossError("Interface ",
-                       *(vlanInfo.second.interfaces.begin()),
-                       " refers to non-existent VLAN ", vlanInfo.first);
-    }
-  }
-
   VlanID dfltVlan(cfg_->defaultVlan);
   if (orig_->getDefaultVlan() != dfltVlan) {
     if (newVlans->getVlanIf(dfltVlan) == nullptr) {
@@ -197,6 +207,33 @@ shared_ptr<SwitchState> ThriftConfigApplier::run() {
     }
     newState->setDefaultVlan(dfltVlan);
     changed = true;
+  }
+
+  // Make sure all interfaces refer to valid VLANs.
+  for (const auto& vlanInfo : vlanInterfaces_) {
+    if (newVlans->getVlanIf(vlanInfo.first) == nullptr) {
+      throw FbossError("Interface ",
+                       *(vlanInfo.second.interfaces.begin()),
+                       " refers to non-existent VLAN ", vlanInfo.first);
+    }
+    // Make sure there is a one-to-one map between vlan and interface
+    // Remove this sanity check if multiple interfaces are allowed per vlans
+    auto& entry = vlanInterfaces_[vlanInfo.first];
+    if (entry.interfaces.size() != 1) {
+      auto cpu_vlan = newState->getDefaultVlan();
+      if (vlanInfo.first != cpu_vlan) {
+        throw FbossError("Vlan ", vlanInfo.first, " refers to ",
+                       entry.interfaces.size(), " interfaces ");
+      }
+   }
+  }
+
+  {
+    auto newAcls = updateAcls();
+    if (newAcls) {
+      newState->resetAcls(std::move(newAcls));
+      changed = true;
+    }
   }
 
   std::chrono::seconds arpAgerInterval(cfg_->arpAgerInterval);
@@ -330,7 +367,8 @@ shared_ptr<Port> ThriftConfigApplier::updatePort(const shared_ptr<Port>& orig,
       VlanID(cfg->ingressVlan) == orig->getIngressVlan() &&
       vlans == orig->getVlans() &&
       cfg->speed == orig->getSpeed() &&
-      (cfg->name.empty() || cfg->name == orig->getName())) {
+      cfg->name == orig->getName() &&
+      cfg->description == orig->getDescription()) {
     return nullptr;
   }
 
@@ -339,11 +377,8 @@ shared_ptr<Port> ThriftConfigApplier::updatePort(const shared_ptr<Port>& orig,
   newPort->setIngressVlan(VlanID(cfg->ingressVlan));
   newPort->setVlans(vlans);
   newPort->setSpeed(cfg->speed);
-  // If the port name isn't set in the config (it's optional),
-  // leave it with the default value.
-  if (!cfg->name.empty()) {
-    newPort->setName(cfg->name);
-  }
+  newPort->setName(cfg->name);
+  newPort->setDescription(cfg->description);
   return newPort;
 }
 
@@ -385,6 +420,17 @@ shared_ptr<Vlan> ThriftConfigApplier::createVlan(const cfg::Vlan* config) {
   auto vlan = make_shared<Vlan>(config, ports);
   updateNeighborResponseTables(vlan.get(), config);
   updateDhcpOverrides(vlan.get(), config);
+
+  /* TODO t7153326: Following code is added for backward compatibility
+  Remove it once coop generates config with */
+  if (config->__isset.intfID) {
+    vlan->setInterfaceID(InterfaceID(config->intfID));
+  } else {
+    auto& entry = vlanInterfaces_[VlanID(config->id)];
+    if (!entry.interfaces.empty()) {
+      vlan->setInterfaceID(*(entry.interfaces.begin()));
+    }
+  }
   return vlan;
 }
 
@@ -405,8 +451,21 @@ shared_ptr<Vlan> ThriftConfigApplier::updateVlan(const shared_ptr<Vlan>& orig,
   auto newDhcpV6Relay = config->__isset.dhcpRelayAddressV6 ?
     IPAddressV6(config->dhcpRelayAddressV6) : IPAddressV6("::");
 
+  /* TODO t7153326: Following code is added for backward compatibility
+  Remove it once coop generates config with intfID */
+  auto oldIntfID = orig->getInterfaceID();
+  auto newIntfID = InterfaceID(0);
+  if (config->__isset.intfID) {
+    newIntfID = InterfaceID(config->intfID);
+  } else {
+    auto& entry = vlanInterfaces_[VlanID(config->id)];
+    if (!entry.interfaces.empty()) {
+      newIntfID = *(entry.interfaces.begin());
+    }
+  }
 
   if (orig->getName() == config->name &&
+      oldIntfID == newIntfID &&
       orig->getPorts() == ports &&
       oldDhcpV4Relay == newDhcpV4Relay &&
       oldDhcpV6Relay == newDhcpV6Relay &&
@@ -415,10 +474,94 @@ shared_ptr<Vlan> ThriftConfigApplier::updateVlan(const shared_ptr<Vlan>& orig,
   }
 
   newVlan->setName(config->name);
+  newVlan->setInterfaceID(newIntfID);
   newVlan->setPorts(ports);
   newVlan->setDhcpV4Relay(newDhcpV4Relay);
   newVlan->setDhcpV6Relay(newDhcpV6Relay);
   return newVlan;
+}
+
+shared_ptr<AclMap> ThriftConfigApplier::updateAcls() {
+  auto origAcls = orig_->getAcls();
+  AclMap::NodeContainer newAcls;
+  bool changed = false;
+
+  // Process all supplied ACLs
+  size_t numExistingProcessed = 0;
+  for (int i = 0; i < cfg_->acls.size(); ++i) {
+    const auto& acl = cfg_->acls[i];
+    auto origAcl = origAcls->getEntryIf(AclEntryID(acl.id));
+    shared_ptr<AclEntry> newAcl;
+    if (origAcl) {
+      newAcl = updateAcl(origAcl, &acl);
+      ++numExistingProcessed;
+    } else {
+      newAcl = createAcl(&acl);
+    }
+    changed |= updateMap(&newAcls, origAcl, newAcl);
+  }
+
+  if (numExistingProcessed != origAcls->size()) {
+    // Some existing ACLs were removed.
+    CHECK_LT(numExistingProcessed, origAcls->size());
+    changed = true;
+  }
+
+  if (!changed) {
+    return nullptr;
+  }
+
+  return origAcls->clone(std::move(newAcls));
+}
+
+shared_ptr<AclEntry> ThriftConfigApplier::createAcl(
+    const cfg::AclEntry* config) {
+  auto newAcl = make_shared<AclEntry>(AclEntryID(config->id));
+  newAcl->setAction(config->action);
+  if (config->__isset.srcIp) {
+    newAcl->setSrcIp(IPAddress::createNetwork(config->srcIp));
+  }
+  if (config->__isset.dstIp) {
+    newAcl->setDstIp(IPAddress::createNetwork(config->dstIp));
+  }
+  if (config->__isset.l4SrcPort) {
+    newAcl->setL4SrcPort(config->l4SrcPort);
+  }
+  if (config->__isset.l4DstPort) {
+    newAcl->setL4DstPort(config->l4DstPort);
+  }
+  if (config->__isset.proto) {
+    newAcl->setProto(config->proto);
+  }
+  if (config->__isset.tcpFlags) {
+    newAcl->setTcpFlags(config->tcpFlags);
+  }
+  if (config->__isset.tcpFlagsMask) {
+    newAcl->setTcpFlagsMask(config->tcpFlagsMask);
+  }
+  return newAcl;
+}
+
+
+shared_ptr<AclEntry> ThriftConfigApplier::updateAcl(
+    const shared_ptr<AclEntry>& orig,
+    const cfg::AclEntry* config) {
+
+  auto newAcl = createAcl(config);
+
+  if (orig->getID() == newAcl->getID() &&
+      orig->getAction() == newAcl->getAction() &&
+      orig->getSrcIp() == newAcl->getSrcIp() &&
+      orig->getDstIp() == newAcl->getDstIp() &&
+      orig->getL4SrcPort() == newAcl->getL4SrcPort() &&
+      orig->getL4DstPort() == newAcl->getL4DstPort() &&
+      orig->getProto() == newAcl->getProto() &&
+      orig->getTcpFlags() == newAcl->getTcpFlags() &&
+      orig->getTcpFlagsMask() == newAcl->getTcpFlagsMask()) {
+    return nullptr;
+  }
+
+  return newAcl;
 }
 
 bool ThriftConfigApplier::updateDhcpOverrides(Vlan* vlan,
@@ -491,7 +634,7 @@ bool ThriftConfigApplier::updateNeighborResponseTables(
   return changed;
 }
 
-shared_ptr<RouteTableMap> ThriftConfigApplier::updateRouteTables() {
+shared_ptr<RouteTableMap> ThriftConfigApplier::updateInterfaceRoutes() {
   flat_set<RouterID> newToAddTables;
   flat_set<RouterID> oldToDeleteTables;
   RouteUpdater updater(orig_->getRouteTables());
@@ -547,6 +690,14 @@ shared_ptr<RouteTableMap> ThriftConfigApplier::updateRouteTables() {
   for (auto id : newToAddTables) {
     updater.addLinkLocalRoutes(id);
   }
+  return updater.updateDone();
+}
+
+
+std::shared_ptr<RouteTableMap> ThriftConfigApplier::updateStaticRoutes(
+    const std::shared_ptr<RouteTableMap>& curRoutingTables) {
+  RouteUpdater updater(curRoutingTables);
+  updater.updateStaticRoutes(*cfg_, *prevCfg_);
   return updater.updateDone();
 }
 
@@ -684,28 +835,32 @@ Interface::Addresses ThriftConfigApplier::getInterfaceAddresses(
 shared_ptr<SwitchState> applyThriftConfig(
     const shared_ptr<SwitchState>& state,
     const cfg::SwitchConfig* config,
-    const Platform* platform) {
-  return ThriftConfigApplier(state, config, platform).run();
+    const Platform* platform,
+    const cfg::SwitchConfig* prevConfig) {
+  cfg::SwitchConfig emptyConfig;
+  return ThriftConfigApplier(state, config, platform,
+      prevConfig ? prevConfig : &emptyConfig).run();
 }
 
-shared_ptr<SwitchState> applyThriftConfigFile(
-    const shared_ptr<SwitchState>& state,
-    StringPiece path,
-    const Platform* platform) {
-  // Parse the JSON config.
+std::pair<std::shared_ptr<SwitchState>, std::string> applyThriftConfigFile(
+  const std::shared_ptr<SwitchState>& state,
+  const folly::StringPiece path,
+  const Platform* platform,
+  const cfg::SwitchConfig* prevConfig) {
   //
   // This is basically what configerator's getConfigAndParse() code does,
   // except that we manually read the file from disk for now.
   // We may not be able to rely on the configerator infrastructure for
   // distributing the config files.
   cfg::SwitchConfig config;
-  std::string contents;
-  if (!folly::readFile(path.toString().c_str(), contents)) {
+  std::string configStr;
+  if (!folly::readFile(path.toString().c_str(), configStr)) {
     throw FbossError("unable to read ", path);
   }
-  config.readFromJson(contents.c_str());
+  config.readFromJson(configStr.c_str());
 
-  return ThriftConfigApplier(state, &config, platform).run();
+  return std::make_pair(
+      applyThriftConfig(state, &config, platform, prevConfig), configStr);
 }
 
 }} // facebook::fboss

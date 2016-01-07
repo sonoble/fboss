@@ -15,6 +15,7 @@
 #include "fboss/agent/types.h"
 #include "fboss/agent/Transceiver.h"
 #include "fboss/agent/TransceiverMap.h"
+#include "fboss/agent/gen-cpp/switch_config_types.h"
 
 #include <folly/SpinLock.h>
 #include <folly/IntrusiveList.h>
@@ -293,6 +294,17 @@ class SwSwitch : public HwSwitch::Callback {
   PortStats* portStats(PortID port);
 
   /*
+   * Get the port speed for the specified port in Mbps.  Zero implies that
+   * speed has been set to the Default (maximum) value.
+   */
+  cfg::PortSpeed getPortSpeed(PortID port) const;
+
+  /*
+   * Get the port speed for the specified port in Mbps.
+   */
+  cfg::PortSpeed getMaxPortSpeed(PortID port) const;
+
+  /*
    * Get PortStatus for all the ports.
    */
   std::map<int32_t, PortStatus> getPortStatus();
@@ -522,13 +534,20 @@ class SwSwitch : public HwSwitch::Callback {
    * Only one port status listener is supported, and calling this multiple
    * times will overwrite the current listener.
    */
-  void registerPortStatusListener(
-      std::function<void(PortID, const PortStatus)> callback);
+  void registerNeighborListener(
+      std::function<void(const std::vector<std::string>& added,
+                         const std::vector<std::string>& deleted)> callback);
+
+  void invokeNeighborListener(const std::vector<std::string>& added,
+                               const std::vector<std::string>& deleted);
 
   /*
    * Returns true if the arp/ndp entry for the passed in ip has been hit.
    */
   bool getAndClearNeighborHit(RouterID vrf, folly::IPAddress ip);
+
+  const std::string& getConfigStr() const { return curConfigStr_; }
+  const cfg::SwitchConfig& getConfig() const { return curConfig_; }
 
  private:
   typedef folly::IntrusiveList<StateUpdate, &StateUpdate::listHook_>
@@ -551,8 +570,9 @@ class SwSwitch : public HwSwitch::Callback {
    * on the Monitoring configuration.
    */
   void publishSfpInfo();
+  void publishPortInfo();
   void publishRouteStats();
-  void publishBootType();
+  void publishBootInfo();
   SwitchRunState getSwitchRunState() const;
   void setSwitchRunState(SwitchRunState desiredState);
   SwitchStats* createSwitchStats();
@@ -586,6 +606,14 @@ class SwSwitch : public HwSwitch::Callback {
    * Notifies all the observers that a state update occured.
    */
   void notifyStateObservers(const StateDelta& delta);
+
+  void logLinkStateEvent(PortID port, bool up);
+
+  // Sets the counter that tracks port status
+  void setPortStatusCounter(PortID port, bool up);
+
+  std::string curConfigStr_;
+  cfg::SwitchConfig curConfig_;
 
   // The HwSwitch object.  This object is owned by the Platform.
   HwSwitch* hw_;
@@ -631,6 +659,14 @@ class SwSwitch : public HwSwitch::Callback {
   folly::EventBase updateEventBase_;
 
   /*
+   * A callback for listening to neighbors coming and going.
+   */
+  std::mutex neighborListenerMutex_;
+  std::function<void(const std::vector<std::string>& added,
+                       const std::vector<std::string>& deleted)>
+    neighborListener_{nullptr};
+
+  /*
    * The list of classes to notify on a state update. This container should only
    * be accessed/modified from the update thread. This removes the need for
    * locking when we access the container during a state update.
@@ -647,9 +683,6 @@ class SwSwitch : public HwSwitch::Callback {
 
   BootType bootType_{BootType::UNINITIALIZED};
   std::unique_ptr<LldpManager> lldpManager_;
-
-  std::mutex portListenerMutex_;
-  std::function<void(PortID, const PortStatus)> portListener_;
 };
 
 }} // facebook::fboss

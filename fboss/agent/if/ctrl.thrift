@@ -33,6 +33,12 @@ struct ArpEntryThrift {
   5: i32 vlanID,
 }
 
+struct L2EntryThrift {
+  1: string mac,
+  2: i32 port,
+  3: i32 vlanID,
+}
+
 struct InterfaceDetail {
   1: string interfaceName,
   2: i32 interfaceId,
@@ -63,13 +69,22 @@ struct ProductInfo {
   18: i16 productVersion,
   19: string bmcMac,
   20: string mgmtMac,
+  21: string fabricLocation,
 }
 
+/*
+ * Values in these counters are cumulative since the last time the agent
+ * started.
+ */
 struct PortErrors {
   1: i64 errors,
   2: i64 discards,
 }
 
+/*
+ * Values in these counters are cumulative since the last time the agent
+ * started.
+ */
 struct PortCounters {
   1: i64 bytes,
   2: i64 ucastPkts,
@@ -88,15 +103,17 @@ enum PortOperState {
   UP = 1,
 }
 
-struct PortStatThrift {
+struct PortInfoThrift {
   1: i32 portId,
   2: i64 speedMbps,
   3: PortAdminState adminState,
   4: PortOperState operState,
+  5: list<i32> vlans,
 
   10: PortCounters output,
   11: PortCounters input,
-  12: string name
+  12: string name,
+  13: string description,
 }
 
 struct NdpEntryThrift {
@@ -113,10 +130,19 @@ enum BootType {
   WARM_BOOT = 2
 }
 
+struct TransceiverIdxThrift {
+  1: i32 transceiverId,
+  2: optional i32 channelId,  # deprecated
+  3: optional list<i32> channels,
+}
+
 struct PortStatus {
   1: bool enabled,
-  2: bool up
+  2: bool up,
+  3: optional bool present,
+  4: optional TransceiverIdxThrift transceiverIdx,
 }
+
 struct CaptureInfo {
   // A name identifying the packet capture
   1: string name
@@ -182,12 +208,50 @@ service FbossCtrl extends fb303.FacebookService {
     throws (1: fboss.FbossBaseError error)
 
   /*
-   * Send packets in binary or hex format to controller
+   * Send packets in binary or hex format to controller.
+   *
+   * This injects the packet into the controller, as if it had been received
+   * from a front-panel port.
    */
   void sendPkt(1: i32 port, 2: i32 vlan, 3: fbbinary data)
     throws (1: fboss.FbossBaseError error)
   void sendPktHex(1: i32 port, 2: i32 vlan, 3: fbstring hex)
     throws (1: fboss.FbossBaseError error)
+
+  /*
+   * Transmit a packet out a specific front panel port.
+   *
+   * The data should contain the full ethernet frame (not including the final
+   * frame check sequence).  It must have an explicit VLAN tag indicating what
+   * VLAN to send the packet on.  (The VLAN tag may be stripped out of the
+   * packet actually sent by the hardware, based on the hardware VLAN tagging
+   * configuration for this VLAN+port.)
+   */
+  void txPkt(1: i32 port, 2: fbbinary data)
+    throws (1: fboss.FbossBaseError error)
+
+  /*
+   * Transmit a packet out to a specific VLAN.
+   *
+   * This causes the packet to be sent out the front panel ports that belong to
+   * this VLAN.
+   *
+   * The data should contain the full ethernet frame (not including the final
+   * frame check sequence).  It must have an explicit VLAN tag indicating what
+   * VLAN to send the packet on.  (The VLAN tag may be stripped out of the
+   * packet actually sent by the hardware, based on the hardware VLAN tagging
+   * configuration for this VLAN.)
+   */
+  void txPktL2(1: fbbinary data) throws (1: fboss.FbossBaseError error)
+
+  /*
+   * Transmit an L3 packet.
+   *
+   * The payload should consist only of the layer 3 header and payload.
+   * The controller will add an appropriate ethernet frame header.  It will
+   * contain the correct next hop information based on the layer 3 header.
+   */
+  void txPktL3(1: fbbinary payload) throws (1: fboss.FbossBaseError error)
 
   /*
    * Flush the ARP/NDP entry with the specified IP address.
@@ -218,29 +282,57 @@ service FbossCtrl extends fb303.FacebookService {
     throws (1: fboss.FbossBaseError error)
   map<i32, InterfaceDetail> getAllInterfaces()
     throws (1: fboss.FbossBaseError error)
-  void registerForPortStatusChanged()
+  void registerForNeighborChanged()
     throws (1: fboss.FbossBaseError error) (thread='eb')
   list<string> getInterfaceList()
     throws (1: fboss.FbossBaseError error)
   list<UnicastRoute> getRouteTable()
     throws (1: fboss.FbossBaseError error)
-  map<i32, PortStatus> getPortStatus(1: list<i32> ports)
-    throws (1: fboss.FbossBaseError error)
   InterfaceDetail getInterfaceDetail(1: i32 interfaceId)
     throws (1: fboss.FbossBaseError error)
 
   /*
-   * Returns all interface related stats for given interfaceId
+   * Return the admin and oper state of ports in the list (all ports
+   * if list is empty).
    */
-  PortStatThrift getPortStats(1: i32 portId)
+  map<i32, PortStatus> getPortStatus(1: list<i32> ports)
     throws (1: fboss.FbossBaseError error)
-  map<i32, PortStatThrift> getAllPortStats()
+
+  /*
+   * Administratively enable/disable a port.  Useful to temporarily change
+   * the admin state of a port, for example to simulate a link flap.  This
+   * does not affect the configuraton, so the port will return to configured
+   * state after, for example, restart.
+   */
+  void setPortState(1: i32 portId, 2: bool enable)
+    throws (1: fboss.FbossBaseError error)
+
+  /*
+   * Return info related to the port including name, description, speed,
+   * counters, ...
+   */
+  PortInfoThrift getPortInfo(1: i32 portId)
+    throws (1: fboss.FbossBaseError error)
+  map<i32, PortInfoThrift> getAllPortInfo()
+    throws (1: fboss.FbossBaseError error)
+
+  /* Legacy names for getPortInfo() and getAllPortInfo() */
+  PortInfoThrift getPortStats(1: i32 portId)
+    throws (1: fboss.FbossBaseError error)
+  map<i32, PortInfoThrift> getAllPortStats()
+    throws (1: fboss.FbossBaseError error)
+
+  /* Return running config */
+  string getRunningConfig()
     throws (1: fboss.FbossBaseError error)
 
   list<ArpEntryThrift> getArpTable()
     throws (1: fboss.FbossBaseError error)
   list<NdpEntryThrift> getNdpTable()
     throws (1: fboss.FbossBaseError error)
+  list<L2EntryThrift> getL2Table()
+    throws (1: fboss.FbossBaseError error)
+
   /*
    * Returns all the DOM information
    */
@@ -299,7 +391,14 @@ service FbossCtrl extends fb303.FacebookService {
   void reloadConfig()
 }
 
-service PortStatusListenerClient extends fb303.FacebookService {
-  void portStatusChanged(1: i32 id, 2: PortStatus ps)
+service NeighborListenerClient extends fb303.FacebookService {
+  /*
+   * Sends list of neighbors that have changed to the subscriber.
+   *
+   * These come in the form of ip address strings which have been added
+   * since the last notification. Changes are not queued between
+   * subscriptions.
+   */
+  void neighborsChanged(1: list<string> added, 2: list<string> removed)
     throws (1: fboss.FbossBaseError error)
 }

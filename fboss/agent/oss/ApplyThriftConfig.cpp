@@ -13,9 +13,10 @@
 
 namespace facebook { namespace fboss {
 
-std::shared_ptr<SwitchState> applyThriftConfigDefault(
+std::pair<std::shared_ptr<SwitchState>, std::string>  applyThriftConfigDefault(
     std::shared_ptr<SwitchState>,
-    const Platform*) {
+    const Platform*,
+    const cfg::SwitchConfig* prevConfig) {
   throw FbossError("Must specify a configuration file with --config");
 }
 

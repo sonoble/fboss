@@ -9,6 +9,10 @@
  */
 #include "fboss/agent/hw/bcm/BcmSwitch.h"
 
+#include "fboss/agent/hw/bcm/BcmRxPacket.h"
+
+#include <folly/Memory.h>
+
 extern "C" {
 #include <opennsl/link.h>
 #include <opennsl/error.h>
@@ -18,6 +22,10 @@ extern "C" {
  * Stubbed out.
  */
 namespace facebook { namespace fboss {
+
+std::unique_ptr<BcmRxPacket> BcmSwitch::createRxPacket(opennsl_pkt_t* pkt) {
+  return folly::make_unique<BcmRxPacket>(pkt);
+}
 
 void BcmSwitch::configureAdditionalEcmpHashSets() {}
 
@@ -45,4 +53,29 @@ int BcmSwitch::getHighresSamplers(
     const std::set<folly::StringPiece>& counterSet) {
   return 0;
 }
+
+void BcmSwitch::exportSdkVersion() const {}
+
+void BcmSwitch::fetchL2Table(std::vector<L2EntryThrift> *l2Table) {
+  return;
+}
+
+void BcmSwitch::initFieldProcessor(bool isWarmBoot) const {
+  // API not available in opennsl
+}
+void BcmSwitch::configureCosQMappingForLocalInterfaces(
+    const StateDelta& delta) const {
+  // API not available in opennsl
+}
+
+void BcmSwitch::createAclGroup() {
+  // API not available in opennsl
+}
+
+// Bcm's ContentAware Processing engine API is not open sourced yet
+void BcmSwitch::processChangedAcl(
+  const std::shared_ptr<AclEntry>& oldAcl,
+  const std::shared_ptr<AclEntry>& newAcl) {}
+void BcmSwitch::processAddedAcl(const std::shared_ptr<AclEntry>& acl) {}
+void BcmSwitch::processRemovedAcl(const std::shared_ptr<AclEntry>& acl) {}
 }} //facebook::fboss

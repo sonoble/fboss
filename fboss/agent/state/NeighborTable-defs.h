@@ -85,6 +85,29 @@ void NeighborTable<IPADDR, ENTRY, SUBCLASS>::addPendingEntry(
  }
 
 template<typename IPADDR, typename ENTRY, typename SUBCLASS>
+bool NeighborTable<IPADDR, ENTRY, SUBCLASS>::
+setEntriesPendingForPort(PortID port) {
+  CHECK(!this->isPublished());
+  // Need a reverse iterator because removing an element from a flat_map
+  // invalidates all iterators after the element removed
+  bool modified = false;
+  auto entryIt = this->rbegin();
+  while (entryIt != this->rend()) {
+    auto entry = *entryIt++;
+    if (entry->getPort() == port) {
+      VLOG(4) << "Marking entry pending for " << entry->getIP().str()
+        << " on port " << port;
+      auto ip = entry->getIP();
+      auto intfId = entry->getIntfID();
+      this->removeNode(entry);
+      addPendingEntry(ip, intfId);
+      modified = true;
+    }
+  }
+  return modified;
+}
+
+template<typename IPADDR, typename ENTRY, typename SUBCLASS>
 bool NeighborTable<IPADDR, ENTRY, SUBCLASS>::prunePendingEntries() {
   CHECK(!this->isPublished());
 
